@@ -181,6 +181,9 @@ examples/neural_graphs/*.yml
 .hydra/
 nemo_experiments/
 
+1
+test_worker_import.py_
+
 slurm*.out
 
 # Onelogger

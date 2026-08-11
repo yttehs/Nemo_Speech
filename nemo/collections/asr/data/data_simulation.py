@@ -14,12 +14,14 @@
 
 import concurrent
 import os
+import random
 import warnings
 from typing import Dict, List, Tuple
 
 import numpy as np
 import soundfile as sf
 import torch
+import copy
 from omegaconf import OmegaConf
 from scipy.signal import convolve
 from scipy.signal.windows import cosine, hamming, hann
@@ -42,6 +44,7 @@ from nemo.collections.asr.parts.utils.data_simulation_utils import (
     perturb_audio,
     read_audio_from_buffer,
     read_noise_manifest,
+    add_silence_to_alignments,
 )
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.asr.parts.utils.speaker_utils import get_overlap_range, is_overlap, merge_float_intervals
@@ -150,12 +153,14 @@ class MultiSpeakerSimulator(object):
     """
 
     def __init__(self, cfg):
+
         self._params = cfg
         self.annotator = DataAnnotator(cfg)
         self.sampler = SpeechSampler(cfg)
         # internal params
         self._manifest = read_manifest(self._params.data_simulator.manifest_filepath)
         self._speaker_samples = build_speaker_samples_map(self._manifest)
+        self._target_rms = self._compute_target_rms()
         self._noise_samples = []
         self._sentence = None
         self._text = ""
@@ -213,8 +218,32 @@ class MultiSpeakerSimulator(object):
 
         # Intialize multiprocessing related variables
         self.num_workers = self._params.get("num_workers", 1)
+        with open("/tmp/num_workers_debug.log", "a") as f:
+            f.write(f"num_workers = {self.num_workers}\n")
+
         self.multiprocessing_chunksize = self._params.data_simulator.get('multiprocessing_chunksize', 10000)
         self.chunk_count = self._init_chunk_count()
+
+    def _compute_target_rms(self, n_samples: int = 200) -> float:
+        """
+        Estimate a realistic per-speaker normalization target from this corpus's
+        own audio, computed once at init time. per_speaker_normalize needs a
+        stable, fixed reference to make loudness consistent both within and
+        across generated sessions -- recomputing it per clip would just undo
+        the normalization it's meant to apply.
+        """
+        all_entries = [e for entries in self._speaker_samples.values() for e in entries]
+        sample = random.sample(all_entries, min(n_samples, len(all_entries)))
+    
+        rms_values = []
+        for entry in sample:
+            audio, sr = sf.read(entry['audio_filepath'])
+            if len(audio) > 0:
+                rms_values.append(float(np.sqrt(np.mean(audio.astype(np.float64) ** 2))))
+    
+        target = float(np.median(rms_values)) if rms_values else 0.075  # fallback only if sampling fails
+        logging.info(f"Computed target_rms = {target:.4f} from {len(rms_values)} sampled clips")
+        return target
 
     def _init_speaker_permutations(self, num_sess: int, num_speakers: int, all_speaker_ids: List, random_seed: int):
         """
@@ -766,7 +795,7 @@ class MultiSpeakerSimulator(object):
 
         # build sentence
         while sentence_word_count < sl and sentence_samples < max_samples_in_sentence:
-            audio_manifest = load_speaker_sample(
+            audio_manifest = self._load_speaker_sample_no_repeat(
                 speaker_wav_align_map=speaker_wav_align_map,
                 speaker_ids=speaker_ids,
                 speaker_turn=speaker_turn,
@@ -798,6 +827,14 @@ class MultiSpeakerSimulator(object):
             sentence_word_count, sentence_samples = self._add_file(
                 audio_manifest, audio_file, sentence_word_count, sl, max_samples_in_sentence
             )
+ 
+            #print ("Volume Check!!!")
+            #print(float(torch.sqrt(torch.mean(audio_file.float() ** 2))))
+            #print ("Volume Check end!!")
+
+            with open("/media/amber/charizard/vishwas/Workspace/Clipto/Nemo/Speech/rms_debug.log", "a") as f:
+                f.write(f"{float(torch.sqrt(torch.mean(audio_file.float() ** 2)))}\n")
+
 
         # per-speaker normalization (accounting for active speaker time)
         if self._params.data_simulator.session_params.normalize and torch.max(torch.abs(self._sentence)) > 0:
@@ -814,6 +851,7 @@ class MultiSpeakerSimulator(object):
                 speaker_turn=speaker_turn,
                 volume=self._volume,
                 device=self._device,
+                target_rms=self._target_rms,
             )
 
     def _add_silence_or_overlap(
@@ -999,7 +1037,8 @@ class MultiSpeakerSimulator(object):
         self._noise_samples = noise_samples
         self._furthest_sample = [0 for n in range(self._params.data_simulator.session_config.num_speakers)]
         self._missing_silence = 0
-
+        self._used_file_ids = {}
+ 
         # hold enforce until all speakers have spoken
         enforce_time = np.random.uniform(
             self._params.data_simulator.speaker_enforcement.enforce_time[0],
@@ -1007,9 +1046,13 @@ class MultiSpeakerSimulator(object):
         )
         enforce = self._params.data_simulator.speaker_enforcement.enforce_num_speakers
 
-        session_len_samples = int(
-            (self._params.data_simulator.session_config.session_length * self._params.data_simulator.sr)
-        )
+        #session_len_samples = int(
+        #    (self._params.data_simulator.session_config.session_length * self._params.data_simulator.sr)
+        #)
+        
+        adaptive_length = self._get_adaptive_session_length(speaker_ids, speaker_wav_align_map)
+        session_len_samples = int(adaptive_length * self._params.data_simulator.sr)
+        
         array = torch.zeros(session_len_samples).to(self._device)
         is_speech = torch.zeros(session_len_samples).to(self._device)
 
@@ -1029,8 +1072,15 @@ class MultiSpeakerSimulator(object):
 
             # Calculate parameters for building a sentence (only add if remaining length >  specific time)
             max_samples_in_sentence = session_len_samples - running_len_samples
+            #if enforce:
+            #    max_samples_in_sentence = float('inf')
             if enforce:
-                max_samples_in_sentence = float('inf')
+                ceiling_samples = int(
+                    self._params.data_simulator.session_config.session_length * self._params.data_simulator.sr
+                )
+                remaining = ceiling_samples - running_len_samples
+                min_enforce_samples = int(2.0 * self._params.data_simulator.sr)  # ~2s floor
+                max_samples_in_sentence = max(remaining, min_enforce_samples)
             elif (
                 max_samples_in_sentence
                 < self._params.data_simulator.session_params.end_buffer * self._params.data_simulator.sr
@@ -1241,6 +1291,66 @@ class MultiSpeakerSimulator(object):
         self.annotator.write_filelist_files(basepath=basepath)
         logging.info(f"Data simulation has been completed, results saved at: {basepath}")
 
+    # New method on MultiSpeakerSimulator, alongside _set_speaker_volume etc.
+    def _load_speaker_sample_no_repeat(self, speaker_wav_align_map, speaker_ids, speaker_turn, min_alignment_count):
+        """
+        Same as load_speaker_sample, but avoids reusing a file already drawn for
+        this speaker earlier in the current session. Once every file has been
+        used once, the pool resets (rather than raising or stalling) so long
+        sessions can still complete.
+        """
+        speaker_id = str(speaker_ids[speaker_turn])
+        available = speaker_wav_align_map[speaker_id]
+        n = len(available)
+    
+        used = self._used_file_ids.setdefault(speaker_id, set())
+        unused_indices = [i for i in range(n) if i not in used]
+        if not unused_indices:
+            used.clear()  # this speaker's pool is exhausted for this session -- reset and continue
+            unused_indices = list(range(n))
+    
+        file_id = int(np.random.choice(unused_indices))
+        used.add(file_id)
+        audio_manifest = available[file_id]
+    
+        if len(audio_manifest['alignments']) < min_alignment_count:
+            raise ValueError(
+                f"Alignment file {audio_manifest['audio_filepath']} has an inappropriate length "
+                f"of {len(audio_manifest['alignments'])} < 2."
+            )
+        if audio_manifest['words'][0] != "":
+            audio_manifest = add_silence_to_alignments(audio_manifest)
+        return copy.deepcopy(audio_manifest)
+
+    def _get_adaptive_session_length(self, speaker_ids, speaker_wav_align_map, min_len=10.0, max_len=None):
+        """
+        Scale session length down from the configured max toward min_len when this
+        session's speakers don't have enough source material to fill max_len
+        without heavy repetition.
+        """
+        if max_len is None:
+            max_len = self._params.data_simulator.session_config.session_length
+    
+        num_speakers = len(speaker_ids)
+        silence_frac = self._params.data_simulator.session_params.mean_silence
+    
+        # Seconds of *speech* each speaker would need to contribute at max_len,
+        # assuming roughly even dominance split and the configured silence proportion.
+        needed_speech_sec_at_max = max_len * (1 - silence_frac) / num_speakers
+    
+        available_sec = [
+            sum(entry['duration'] for entry in speaker_wav_align_map[str(sid)])
+            for sid in speaker_ids
+        ]
+        tightest = min(available_sec)
+        if tightest <= 0:
+            return min_len
+    
+        # Safety margin above the bare minimum, so segmentation/buffers don't
+        # still force repeats even when the raw total looks technically sufficient.
+        safety_margin = 1.5
+        ratio = min(max(tightest / (needed_speech_sec_at_max * safety_margin), 0.0), 1.0)
+        return min_len + ratio * (max_len - min_len)
 
 class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):
     """
@@ -1515,6 +1625,8 @@ class RIRMultiSpeakerSimulator(MultiSpeakerSimulator):
         self.annotator.init_annotation_lists()
         self._noise_samples = noise_samples
         self._furthest_sample = [0 for n in range(self._params.data_simulator.session_config.num_speakers)]
+        self._missing_silence = 0
+        self._used_file_ids = {}
 
         # Room Impulse Response Generation (performed once per batch of sessions)
         if self._params.data_simulator.rir_generation.toolkit == 'gpuRIR':

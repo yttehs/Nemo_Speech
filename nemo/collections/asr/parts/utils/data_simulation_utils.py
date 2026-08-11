@@ -645,7 +645,25 @@ def get_split_points_in_alignments(
     return splits
 
 
+
 def per_speaker_normalize(
+    sentence_audio: torch.Tensor, splits: List[List[int]], speaker_turn: int, volume: List[float], device: torch.device,
+    target_rms: float = 0.075,  # NEW -- grounded in this corpus's real median RMS, not an arbitrary constant
+) -> torch.Tensor:
+    """
+    Normalize time-series audio signal per speaker.
+    ...
+    """
+    split_length = torch.tensor(0).to(device).double()
+    split_sum = torch.tensor(0).to(device).double()
+    for split in splits:
+        split_length += len(sentence_audio[split[0] : split[1]])
+        split_sum += torch.sum(sentence_audio[split[0] : split[1]] ** 2)
+    average_rms = torch.sqrt(split_sum * 1.0 / split_length)
+    sentence_audio = sentence_audio / (1.0 * average_rms) * volume[speaker_turn] * target_rms  # NEW -- was missing target_rms
+    return sentence_audio
+
+def per_speaker_normalize_old(
     sentence_audio: torch.Tensor, splits: List[List[int]], speaker_turn: int, volume: List[float], device: torch.device
 ) -> torch.Tensor:
     """
