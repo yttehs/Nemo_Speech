@@ -172,6 +172,8 @@ examples/*/data
 wandb
 dump.py
 
+results
+multitalker_finetune_experiments
 docs/sources/source/test_build/
 
 # Checkpoints, config files and temporary files created in tutorials.

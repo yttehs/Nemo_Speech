@@ -1,0 +1,136 @@
+# Override config for fine-tuning EncDecMultiTalkerRNNTBPEModel from a pretrained
+# Parakeet-TDT-0.6B-v3 checkpoint. This is NOT a standalone config -- it gets merged
+# ON TOP OF the pretrained model's own config in train_multitalker.py, so that the
+# encoder/decoder/joint architecture always matches the pretrained weights exactly.
+# Only multitalker-specific, data, and training keys are set here.
+
+model:
+  # --- Speaker kernel injection (SpeakerKernelMixin) ---
+  # 'ff' is the only implemented kernel type in this codebase as of this repo snapshot
+  # (SpeakerKernelMixin.get_spk_kernel_class raises ValueError for anything else).
+  spk_kernel_type: 'ff'
+  # Which encoder layer indices get a kernel injected. [0] is the mixin's own default.
+  # Worth experimenting with later (e.g. injecting at multiple layers) once a single-layer
+  # baseline is confirmed working -- not a verified-optimal choice, just the safe starting point.
+  spk_kernel_layers: [0]
+  # bg_spk_targets is used unconditionally in training_step (spk_targets, bg_spk_targets
+  # = additional_args), so this needs to be true for the six-element batch shape to match.
+  add_bg_spk_kernel: true
+
+  train_ds:
+    use_lhotse: true
+    cuts_path: ???  # set via CLI override or fill in: /path/to/train_cuts.jsonl.gz
+    num_speakers: 4
+    min_duration: 1.0
+    max_duration: 30.0
+    max_tps: 8.0              # tightened from 12 -- OOM persisted even at fused_batch_size=1,
+                               # suggesting real batch-to-batch variance in target text
+                               # density. This directly bounds that root cause, independent
+                               # of GPU count.
+    shuffle: true
+    use_bucketing: true
+    num_buckets: 10          # starting point given cut lengths now span ~1-30s; not tuned
+    batch_duration: 12       # reduced again after a bigger-margin OOM (needed 1.54 GiB,
+                              # had 272 MiB) even with DDP + max_tps=8 + fused_batch_size=1.
+                              # Watch actual GPU memory on your 1080Tis and adjust; this is
+                              # not derived from any measurement, just a conservative guess
+                              # given an 8GB budget and a 600M-parameter frozen backbone.
+    quadratic_duration: 30   # de-prioritizes batching very long cuts together; matches max_duration
+
+  validation_ds:
+    use_lhotse: true
+    cuts_path: ???  # /path/to/val_cuts.jsonl.gz
+    num_speakers: 4
+    min_duration: 1.0
+    max_duration: 30.0
+    max_tps: 8.0
+    shuffle: false
+    use_bucketing: false     # no need to bucket a small, one-pass validation set
+    batch_duration: 12
+
+  test_ds:
+    use_lhotse: true
+    cuts_path: ???  # /path/to/test_cuts.jsonl.gz
+    num_speakers: 4
+    min_duration: 1.0
+    max_duration: 30.0
+    max_tps: 8.0
+    shuffle: false
+    use_bucketing: false
+    batch_duration: 12
+
+  decoding:
+    # Confirmed exact YAML key from the RNNTBPEDecodingConfig dataclass (NOT the Python
+    # attribute name joint_fused_batch_size, which only exists after NeMo reads this in).
+    # Reduced from 4 -> 2 after hitting a near-miss OOM (56 MiB short) specifically inside
+    # this computation on step 3 of a real training run. Try this before touching
+    # batch_duration, since it's the most targeted lever for exactly what OOM'd.
+    fused_batch_size: 1
+
+  optim:
+    name: adamw
+    lr: 1e-4              # conservative starting point for adapter-only fine-tuning --
+                            # the paper's 3e-4 peak LR was for full/larger-scale training runs,
+                            # not directly transferable to this much smaller adapter-only setup
+    weight_decay: 1e-3
+    betas: [0.9, 0.98]
+    sched:
+      name: WarmupAnnealing
+      warmup_steps: 200     # small, given how little data this trains on -- not tuned
+      max_steps: 8750        # rough estimate: 525 train cuts / ~3 cuts per 60s batch
+                              # ~= 175 steps/epoch * 50 epochs. Approximate, since Lhotse's
+                              # duration-based dynamic batching means actual cuts-per-batch
+                              # varies -- but this key is REQUIRED to avoid a crash, since
+                              # the scheduler otherwise falls back to len(train_dataloader.dataset),
+                              # which LhotseSpeechToTextSpkBpeDataset does not implement at all
+                              # (it's a lazy, cuts-driven dataset, not a fixed-length one).
+                              # Once you see the real steps/epoch reported in early logs,
+                              # worth revisiting this to match actual observed throughput.
+      min_lr: 1e-6
+
+trainer:
+  devices: 2                # single-GPU path already proven working end-to-end (real
+                            # training steps completed) -- moving to both GPUs now,
+                            # combined with a further per-GPU batch_duration cut below,
+                            # since DDP does NOT reduce per-GPU memory on its own (each
+                            # GPU processes its own full batch independently; gradients
+                            # only get synchronized after backward). The actual fix for
+                            # OOM is the smaller batch_duration -- DDP's role here is
+                            # recovering effective throughput/global batch size lost by
+                            # cutting it further.
+  strategy: ddp
+  use_distributed_sampler: false  # Lhotse's sampler already shards data per-rank natively
+                                    # (global_rank/world_size passed explicitly in
+                                    # _setup_dataloader_from_config) -- Lightning's generic
+                                    # DistributedSamplerWrapper is redundant here and crashes
+                                    # anyway, since Lhotse's duration-based dynamic samplers
+                                    # have no __len__ for it to wrap.
+  accelerator: gpu
+  logger: false             # exp_manager sets up its own logger (create_tensorboard_logger
+                            # below); Lightning's own default logger must be disabled or
+                            # exp_manager refuses to proceed, to avoid double-logging
+  enable_checkpointing: false  # same reasoning -- exp_manager sets up its own ModelCheckpoint
+                                # (create_checkpoint_callback below); Lightning's default one
+                                # must be disabled or exp_manager refuses to proceed
+  precision: 16-mixed       # 1080Ti (Pascal) has no Tensor Cores, so this won't speed
+                            # things up -- but it still roughly halves activation/weight
+                            # memory, which matters a lot on 8GB
+  max_epochs: 50            # generous upper bound; with only ~525 train cuts but a
+                            # different random target speaker sampled every __getitem__
+                            # call, effective example diversity per epoch is higher than
+                            # the raw cut count suggests -- watch val_loss and stop early
+  val_check_interval: 1.0
+  accumulate_grad_batches: 2  # raised after cutting batch_duration in half, to recover
+                                # for memory reasons -- this is the lever to compensate
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+
+exp_manager:
+  exp_dir: ./multitalker_finetune_experiments
+  name: multitalker_pt_adapter
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: val_loss
+    mode: min
+    save_top_k: 3
+  create_tensorboard_logger: true
