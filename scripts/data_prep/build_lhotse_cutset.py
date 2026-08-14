@@ -69,7 +69,12 @@ for json_path in json_files:
             recording_id=session_name,
             start=e["offset"],
             duration=e["duration"],
-            text=e["text"],
+            text=e["text"].lower(),  # VoxForge's prompt files are all-caps by convention,
+                                       # not a real casing signal -- the pretrained model's
+                                       # tokenizer/decoder was trained on naturally-cased
+                                       # text, so leaving targets all-caps forces it to learn
+                                       # an irrelevant casing shift on top of the actual task,
+                                       # and may inflate WER if the metric is case-sensitive.
             speaker=e["label"],
         )
         for i, e in enumerate(kept_entries)

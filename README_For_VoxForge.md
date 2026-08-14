@@ -176,8 +176,36 @@ python scripts/data_prep/inspect_cutset.py --cuts_path /media/amber/charizard/vi
 
 Train/Fine-tune the model
 Script and the yaml file has been generated using Claude after looking into all the scripts in the repository
-1)python train_multitalker.py \
+Note: If you don't istantiate "LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" you will get "Core dumped" Error - Some cublas mismatch issue
+1)LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python train_multitalker.py \
   --overrides conf/multitalker_finetune_overrides.yaml \
   --train_cuts /media/amber/charizard/vishwas/Workspace/Clipto/Data/Voxforge/Portuguese/train_pooled/train_cuts.jsonl.gz \
   --val_cuts /media/amber/charizard/vishwas/Workspace/Clipto/Data/Voxforge/Portuguese/val_pooled/val_cuts.jsonl.gz \
   --test_cuts /media/amber/charizard/vishwas/Workspace/Clipto/Data/Voxforge/Portuguese/test_pooled/test_cuts.jsonl.gz
+
+Testing the above Fine-tuned model
+Script generated using Claude
+1a) Testing using NFA rttm for diarization and as ground truth labels. 
+LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python evaluate_checkpoint.py \
+  --overrides conf/multitalker_finetune_overrides_aws.yaml \
+  --checkpoint "multitalker_finetune_experiments/multitalker_pt_adapter_aws/2026-08-13_10-22-31/checkpoints/multitalker_pt_adapter_aws--val_wer=0.6957-epoch=46.ckpt" \
+  --test_cuts Data/test_pooled/test_cuts.jsonl.gz
+
+1b) Use Sortformer rttm for diarization and NFA rttm as ground truth labels - Expect very high WER here
+i) Generate Sortformer diarization labels (rttm) files
+LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib"  python scripts/data_prep/run_sortformer_batch.py --wav_dir Data/test_pooled --output_dir Data/test_pooled_sortformer_preds
+
+ii) Evaluate
+LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python evaluate_checkpoint_sortformer_conditioned.py --overrides conf/multitalker_finetune_overrides_aws.yaml --checkpoint "multitalker_finetune_experiments/multitalker_pt_adapter_aws/2026-08-13_10-22-31/checkpoints/multitalker_pt_adapter_aws--val_wer=0.6957-epoch=46.ckpt" --dummy_cuts_path Data/test_pooled/test_cuts.jsonl.gz --ref_dir Data/test_pooled --pred_dir Data/test_pooled_sortformer_preds
+
+1c) Test on real audio samples - downloaded from youtube - No NFA rttm files - No ref transcriptions.
+i) Generate Sortformer diarization labels (rttm) files
+LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib"  python scripts/data_prep/run_sortformer_batch.py --wav_dir Data/real_audio --output_dir Data/real_audio_sortformer_preds
+
+ii) Evaluate; does one audio file at a time; for all file use: real_audio_evaluation.sh
+LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python evaluate_checkpoint_sortformer_conditioned_real_audio.py \
+        --overrides conf/multitalker_finetune_overrides_aws.yaml \
+        --checkpoint "multitalker_finetune_experiments/multitalker_pt_adapter_aws/2026-08-13_10-22-31/checkpoints/multitalker_pt_adapter_aws--val_wer=0.6957-epoch=46.ckpt" \
+        --wav_path Data/real_audio/<wav_name> \
+        --sortformer_rttm Data/real_audio_sortformer_preds/<rttm_name> \
+        --dummy_cuts_path Data/test_pooled/test_cuts.jsonl.gz   #Any dummy path; not used by the script
