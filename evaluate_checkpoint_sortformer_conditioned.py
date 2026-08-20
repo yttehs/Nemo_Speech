@@ -7,11 +7,25 @@ score_der's own overlap-based matching (reused directly, not reimplemented),
 timing for that speaker, (3) score against the GROUND-TRUTH speaker's real
 reference text.
 
-Interpret cautiously: a gap between this and Tier 1 (ground-truth-conditioned)
-could reflect the ASR model's own quality OR Sortformer's known struggles with
-simulated/spliced audio specifically (see the earlier DER investigation) --
-these aren't distinguishable from this number alone. Tier 3 (real audio) is
-the one that isolates ASR quality from that confound.
+Also reports Sortformer's own Diarization Error Rate against the MFA-derived
+ground truth, aggregated (time-weighted, not a naive per-session average) and
+broken down per-session -- this was previously computed internally by score_der()
+purely to build the speaker mapping, then discarded without ever being reported.
+DER is accumulated for EVERY session with valid files, independent of whether a
+usable speaker mapping comes out of it: a session where Sortformer predicted no
+speech at all has an empty mapping (and gets skipped for WER scoring, since
+there's nothing to condition transcription on) but still has a real, meaningful
+DER (100% missed) -- silently excluding it from the DER report would hide exactly
+the kind of total-failure case this report exists to catch.
+
+Interpret the WER number cautiously: a gap between this and Tier 1 (ground-truth-
+conditioned) could reflect the ASR model's own quality OR Sortformer's known
+struggles with simulated/spliced audio specifically (see the earlier DER
+investigation) -- these aren't distinguishable from the WER number alone. That's
+exactly what the new DER report is for: a poor DER here, on clean simulated audio
+with real ground truth, points at diarization as a contributing factor before ever
+touching the noise/duration confounds real audio introduces. Tier 3 (real audio)
+remains the one that isolates ASR quality from the diarization confound entirely.
 
 Run run_sortformer_batch.py on test_pooled FIRST to get predicted RTTMs.
 
@@ -65,7 +79,15 @@ def main():
 
     total_sub = total_del = total_ins = total_ref_words = 0
     n_pairs_scored = 0
-    n_sessions_skipped = 0
+    n_missing_files = 0
+    n_no_wer_mapping = 0
+
+    total_missed = total_false_alarm = total_confusion = total_correct = 0.0
+    total_ref_time_der = 0.0
+    per_session_der = []
+    per_session_wer_stats = {}  # session_name -> [sub, del, ins, ref_words], accumulated across
+                                  # that session's own speaker-pairs -- separate from the DER dict
+                                  # above (keyed the same way) so the two can be joined afterward
 
     for pred_rttm in pred_rttms:
         session_name = pred_rttm.stem
@@ -73,13 +95,22 @@ def main():
         ref_json = args.ref_dir / f"{session_name}.json"
         wav_path = args.ref_dir / f"{session_name}.wav"
         if not (ref_rttm.exists() and ref_json.exists() and wav_path.exists()):
-            n_sessions_skipped += 1
+            n_missing_files += 1
             continue
 
         der_result = score_der(ref_rttm, pred_rttm, collar=args.collar)
+
+        if der_result.get("der") is not None:
+            total_missed += der_result["missed"]
+            total_false_alarm += der_result["false_alarm"]
+            total_confusion += der_result["confusion"]
+            total_correct += der_result["correct"]
+            total_ref_time_der += der_result["total_ref_time"]
+            per_session_der.append((session_name, der_result["der"], der_result["total_ref_time"]))
+
         mapping = der_result.get("speaker_mapping", {})
         if not mapping:
-            n_sessions_skipped += 1
+            n_no_wer_mapping += 1
             continue
 
         ref_texts = ground_truth_text_per_speaker(ref_json)
@@ -105,16 +136,82 @@ def main():
             total_ref_words += n_ref
             n_pairs_scored += 1
 
+            stats = per_session_wer_stats.setdefault(session_name, [0, 0, 0, 0])
+            stats[0] += n_sub
+            stats[1] += n_del
+            stats[2] += n_ins
+            stats[3] += n_ref
+
             print(f"[{session_name}] ref_speaker={ref_speaker} -> sortformer={sortformer_speaker}  WER={wer:.3f}")
             print(f"    reference:  {reference_text}")
             print(f"    hypothesis: {hypothesis_text}\n")
 
-    print(f"\nScored {n_pairs_scored} speaker-pairs across sessions ({n_sessions_skipped} sessions skipped)")
+    print(f"\nScored {n_pairs_scored} speaker-pairs across sessions "
+          f"({n_missing_files} sessions missing files, "
+          f"{n_no_wer_mapping} sessions had no usable speaker mapping for WER)")
     overall_wer = (
         (total_sub + total_del + total_ins) / total_ref_words if total_ref_words > 0 else float("nan")
     )
     print(f"Overall Tier 2 WER: {overall_wer:.4f}  "
           f"(sub={total_sub}, del={total_del}, ins={total_ins}, ref_words={total_ref_words})")
+
+    print(f"\n--- Diarization Error Rate (Sortformer vs. MFA ground truth, collar={args.collar}s) ---")
+    if total_ref_time_der > 0:
+        overall_der = (total_missed + total_false_alarm + total_confusion) / total_ref_time_der
+        # Time-weighted, not a naive average of per-session DER values -- a session
+        # with 5s of reference speech and one with 50s shouldn't count equally.
+        print(f"Overall DER: {overall_der:.4f}  (time-weighted across {len(per_session_der)} sessions, "
+              f"{total_ref_time_der:.1f}s total reference speech)")
+        print(f"  missed={total_missed/total_ref_time_der:.4f}  "
+              f"false_alarm={total_false_alarm/total_ref_time_der:.4f}  "
+              f"confusion={total_confusion/total_ref_time_der:.4f}  "
+              f"(fractions of total reference speech time)")
+
+        print(f"\nPer-session DER, worst to best:")
+        for session_name, der, ref_time in sorted(per_session_der, key=lambda x: -x[1]):
+            print(f"  {der:.4f}  {session_name}  (ref_time={ref_time:.1f}s)")
+    else:
+        print("No sessions had a computable DER -- check that ref/pred RTTMs contain real speech.")
+
+    # --- Does DER actually explain the WER gap, or is something else going on? ---
+    # Joins the two per-session dicts above by session_name. Only sessions with BOTH a
+    # computed DER and at least one scored WER pair are included -- a session that got
+    # skipped for WER (empty mapping) has no WER value to correlate against, even though
+    # it has a DER value from the block above.
+    joined = []
+    for session_name, der, ref_time in per_session_der:
+        stats = per_session_wer_stats.get(session_name)
+        if stats is None:
+            continue
+        sub, del_, ins, ref_words = stats
+        if ref_words == 0:
+            continue
+        session_wer = (sub + del_ + ins) / ref_words
+        joined.append((session_name, der, session_wer))
+
+    print(f"\n--- DER vs. WER correlation ({len(joined)} sessions with both) ---")
+    if len(joined) >= 2:
+        ders = [d for _, d, _ in joined]
+        wers = [w for _, _, w in joined]
+        mean_der = sum(ders) / len(ders)
+        mean_wer = sum(wers) / len(wers)
+        cov = sum((d - mean_der) * (w - mean_wer) for d, w in zip(ders, wers))
+        std_der = (sum((d - mean_der) ** 2 for d in ders)) ** 0.5
+        std_wer = (sum((w - mean_wer) ** 2 for w in wers)) ** 0.5
+        if std_der > 0 and std_wer > 0:
+            pearson_r = cov / (std_der * std_wer)
+            print(f"Pearson correlation (session DER, session WER): {pearson_r:.3f}")
+            print("  (near 0 -> DER doesn't explain session-to-session WER variation, something else "
+                  "does; closer to 1 -> sessions with worse diarization consistently show worse WER, "
+                  "i.e. diarization IS a real driver of the WER gap)")
+        else:
+            print("Can't compute correlation -- no variance in DER or WER across these sessions.")
+
+        print(f"\nPer-session DER and WER side by side, worst DER first:")
+        for session_name, der, wer in sorted(joined, key=lambda x: -x[1]):
+            print(f"  DER={der:.4f}  WER={wer:.4f}  {session_name}")
+    else:
+        print("Not enough sessions with both a DER and a scored WER to compute a correlation.")
 
 
 if __name__ == "__main__":

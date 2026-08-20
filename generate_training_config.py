@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""
+Generates a dataset-specific multitalker training override config from
+multitalker_finetune_overrides_template.yaml, by measuring the REAL session
+duration distribution and session count from your actual combined train/dev/test
+Lhotse cutsets -- rather than reusing another language/dataset's numbers, which
+has already caused two real bugs in this project's history:
+  - train_ds.max_duration copied unchanged from an earlier, differently-scaled
+    dataset silently filtered out 100% of the new dataset's sessions (every
+    session exceeded the reused cap), producing a 50-epoch run that trained
+    on nothing at all.
+  - optim.sched.max_steps copied unchanged under-scheduled training for a
+    larger dataset with a different session-duration profile.
+
+Computes:
+  max_duration / quadratic_duration:
+    ceil(observed_max_duration * duration_headroom / round_to) * round_to
+    -- headroom above the observed max, not just clearing it exactly, in case
+    a future re-generation of the dataset slightly increases it. Defaults
+    (10% headroom, rounded up to the nearest 10) exactly reproduce both prior
+    baselines' own hand-computed values: Portuguese (52.3s real max -> 60.0),
+    Spanish (81.1s real max -> 90.0).
+
+  max_steps:
+    cuts_per_batch = batch_duration / mean_train_session_duration
+    steps_per_epoch = n_train_sessions / cuts_per_batch
+    max_steps = round(steps_per_epoch * max_epochs / accumulate_grad_batches)
+    -- same formula used by hand for both prior baselines, generalized. Still
+    an ESTIMATE, not a guarantee -- Lhotse's dynamic batching means the real
+    cuts/batch varies. Watch NeMo's own reported steps/epoch early in
+    training and re-generate if it's meaningfully different from what this
+    script prints.
+
+  warmup_steps:
+    round(max_steps * warmup_ratio). Default ratio matches both prior
+    baselines' own ~6.35% (400/6300 for the Portuguese-CML run) -- not
+    independently re-tuned per dataset, just carried forward as a convention.
+
+max_duration is computed from the OVERALL max across train+dev+test combined,
+not train alone -- train happened to have the highest max in both prior
+datasets, but that's not guaranteed, and all three dataloaders share the same
+max_duration value in the template.
+
+Usage:
+    python generate_training_config.py \
+        --template multitalker_finetune_overrides_template.yaml \
+        --train_cuts Data_Spanish/multitalker_train_data/train_cuts.jsonl.gz \
+        --dev_cuts Data_Spanish/multitalker_train_data/dev_cuts.jsonl.gz \
+        --test_cuts Data_Spanish/multitalker_train_data/test_cuts.jsonl.gz \
+        --exp_name multitalker_es_cmltts_aws \
+        --output conf/multitalker_finetune_overrides_aws_cmltts_es.yaml
+"""
+import argparse
+import math
+from pathlib import Path
+
+from lhotse import CutSet
+
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("--template", required=True, type=Path)
+ap.add_argument("--train_cuts", required=True, type=Path)
+ap.add_argument("--dev_cuts", required=True, type=Path)
+ap.add_argument("--test_cuts", required=True, type=Path)
+ap.add_argument("--exp_name", required=True,
+                 help="Unique exp_manager.name for this run -- must not collide with any other "
+                      "baseline's name, or checkpoints could get written into the same directory.")
+ap.add_argument("--output", required=True, type=Path)
+ap.add_argument("--batch_duration", type=float, default=90.0,
+                 help="Must match train_ds.batch_duration in the template -- this script doesn't "
+                      "read it back out of the template, so keep them in sync if you ever change it.")
+ap.add_argument("--max_epochs", type=int, default=50,
+                 help="Must match trainer.max_epochs in the template, same sync caveat as batch_duration.")
+ap.add_argument("--accumulate_grad_batches", type=int, default=2,
+                 help="Must match trainer.accumulate_grad_batches in the template, same caveat.")
+ap.add_argument("--duration_headroom", type=float, default=1.1,
+                 help="max_duration = ceil(observed_max * this / --round_to) * --round_to")
+ap.add_argument("--round_to", type=float, default=10.0)
+ap.add_argument("--warmup_ratio", type=float, default=400 / 6300,
+                 help="warmup_steps = max_steps * this ratio. Default matches both prior baselines' "
+                      "own ratio, not independently re-tuned.")
+ap.add_argument("--resume_from_dir", default=None,
+                 help="Only needed when resuming a run that was ALREADY interrupted before this "
+                      "template's resume_if_exists=true was active -- such a run has a timestamped "
+                      "version folder (e.g. multitalker_finetune_experiments/<name>/2026-08-20_02-02-26) "
+                      "because resume_if_exists being off is what caused NeMo to create one. Pass that "
+                      "exact directory here to set exp_manager.explicit_log_dir, pointing resumption "
+                      "directly at it. Leave unset for a normal fresh run -- resume_if_exists is "
+                      "already on by default in this template, so a fresh run's own eventual "
+                      "interruption won't need this at all; NeMo will find its own checkpoints "
+                      "automatically next time.")
+args = ap.parse_args()
+
+
+def main():
+    print("Loading cutsets to measure the real duration distribution...")
+    train_cuts = list(CutSet.from_file(args.train_cuts))
+    dev_cuts = list(CutSet.from_file(args.dev_cuts))
+    test_cuts = list(CutSet.from_file(args.test_cuts))
+
+    all_durations = [c.duration for c in train_cuts + dev_cuts + test_cuts]
+    train_durations = [c.duration for c in train_cuts]
+
+    observed_max = max(all_durations)
+    n_train = len(train_cuts)
+    train_mean = sum(train_durations) / n_train
+
+    print(f"  train: n={n_train}, mean={train_mean:.2f}s")
+    print(f"  overall (train+dev+test): min={min(all_durations):.2f}s, max={observed_max:.2f}s")
+
+    max_duration = math.ceil(observed_max * args.duration_headroom / args.round_to) * args.round_to
+    cuts_per_batch = args.batch_duration / train_mean
+    steps_per_epoch = n_train / cuts_per_batch
+    max_steps = round(steps_per_epoch * args.max_epochs / args.accumulate_grad_batches)
+    warmup_steps = round(max_steps * args.warmup_ratio)
+
+    print(f"\nComputed values:")
+    print(f"  max_duration / quadratic_duration: {max_duration}")
+    print(f"  max_steps: {max_steps}  (~{steps_per_epoch:.0f} steps/epoch)")
+    print(f"  warmup_steps: {warmup_steps}")
+    print(f"  exp_manager.name: {args.exp_name}")
+    resume_log_dir_value = "null" if args.resume_from_dir is None else args.resume_from_dir
+    print(f"  exp_manager.explicit_log_dir: {resume_log_dir_value}")
+
+    template_text = args.template.read_text(encoding="utf-8")
+    filled = (
+        template_text
+        .replace("__MAX_DURATION_FLOAT__", f"{max_duration:.1f}")
+        .replace("__MAX_DURATION_INT__", f"{int(max_duration)}")
+        .replace("__MAX_STEPS__", str(max_steps))
+        .replace("__WARMUP_STEPS__", str(warmup_steps))
+        .replace("__EXP_NAME__", args.exp_name)
+        .replace("__RESUME_LOG_DIR__", resume_log_dir_value)
+    )
+
+    remaining = [tok for tok in ["__MAX_DURATION_FLOAT__", "__MAX_DURATION_INT__", "__MAX_STEPS__",
+                                  "__WARMUP_STEPS__", "__EXP_NAME__", "__RESUME_LOG_DIR__"] if tok in filled]
+    if remaining:
+        raise SystemExit(f"ERROR: placeholder(s) {remaining} still present after substitution -- "
+                          f"the template may have changed without this script being updated to match.")
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(filled, encoding="utf-8")
+    print(f"\nWritten to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
