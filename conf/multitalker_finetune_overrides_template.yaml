@@ -40,10 +40,14 @@ model:
     shuffle: true
     use_bucketing: true
     num_buckets: 10           # starting point given cut lengths span ~1-30s; not tuned
-    batch_duration: 90        # relaxed substantially given ~5.75x more VRAM than the 1080Ti
-                               # (8GB -> 46GB). This is a fresh starting guess, NOT measured
-                               # against actual L40S memory usage -- watch nvidia-smi on the
-                               # first run and adjust up/down from here.
+    batch_duration: __BATCH_DURATION__  # auto-filled from --batch_duration, default 90 -- this
+                               # was always an untested guess (see generate_training_config.py's
+                               # own docstring), confirmed the hard way to be too aggressive when
+                               # sharing a GPU with another process AND a dataset with a long
+                               # session-duration tail (Spanish: up to 81.1s). Lower this via
+                               # --batch_duration if you hit CUDA OOM -- doing so through the
+                               # generator (not a manual edit) keeps max_steps/warmup_steps
+                               # correctly recomputed for the new value automatically.
     quadratic_duration: __MAX_DURATION_INT__  # matches max_duration above, auto-computed
                                # as before, this exists specifically to de-prioritize batching very
                                # long cuts together, and needs to track whatever the real cap is
@@ -60,7 +64,7 @@ model:
     max_tps: 20.0
     shuffle: false
     use_bucketing: false      # no need to bucket a small, one-pass validation set
-    batch_duration: 90
+    batch_duration: __BATCH_DURATION__  # matches train_ds, auto-filled
     num_workers: 0            # CHANGED from 2 -- multi-worker splitting crashed with "max() iterable
                                # argument is empty" during sanity check on this 100-session dataset
                                # (each DataLoader worker gets its own independently-seeded randomized
@@ -81,7 +85,7 @@ model:
     max_tps: 20.0
     shuffle: false
     use_bucketing: false
-    batch_duration: 90
+    batch_duration: __BATCH_DURATION__  # matches train_ds, auto-filled
     num_workers: 0            # CHANGED from 2, same reasoning as validation_ds above
 
   decoding:
@@ -89,6 +93,20 @@ model:
     # attribute name joint_fused_batch_size, which only exists after NeMo reads this in).
     # Relaxed from 1 (1080Ti, memory-constrained) back up given the much larger VRAM budget.
     fused_batch_size: 8
+    greedy:
+      use_cuda_graph_decoder: false  # Added after a real CUDA OOM investigation: NeMo's own
+        # logs show "CUDA graphs disabled/enabled for ...GreedyBatchedTDTInfer" toggling every
+        # single train<->validate transition (the decoder gets rebuilt via
+        # change_decoding_strategy() each time, re-enabling graphs). Capturing a new CUDA graph
+        # needs its own buffers allocated before the old ones are released -- a plausible
+        # transient memory spike right at that transition. Confirmed NOT explained by batch
+        # size: OOM recurred at batch_duration=90, 60, AND 45 despite ~90% smaller batches and
+        # IDENTICAL steady-state GPU memory (~20GB) across all three -- ruling out batch
+        # composition as the driver. This flag is confirmed to exist in NeMo (real fix for the
+        # same decoder class in an unrelated project), but NOT YET independently verified as
+        # the actual fix in THIS codebase/version -- if OmegaConf rejects this key or training
+        # still OOMs at the same transition after adding it, that's real information, not a
+        # dead end; report back either way.
 
   optim:
     name: adamw

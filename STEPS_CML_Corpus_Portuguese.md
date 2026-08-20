@@ -6,18 +6,21 @@ cp -r /data/home/vishwas/Workspace/FastMSS/Data/fastmss_final Data/.
 ```bash
 Note: We will have to generate the yaml file based on the data being used. Few hyperparamters need to be set after checking the data sample duration.
 
-python generate_training_config.py \
+python scripts/conf/generate_training_config.py \
     --template conf/multitalker_finetune_overrides_template.yaml \
     --train_cuts Data/CML_Corpus/multitalker_train_data/train_cuts.jsonl.gz \
     --dev_cuts Data/CML_Corpus/multitalker_train_data/dev_cuts.jsonl.gz \
     --test_cuts Data/CML_Corpus/multitalker_train_data/test_cuts.jsonl.gz \
     --exp_name multitalker_pt_cmltts_aws \
     --output conf/multitalker_finetune_overrides_aws_cmltts_pt.yaml  
+    --batch_duration 90
+
+# You can update the batch duration if you get GPU memeory issues.
 ```
 
 ## Train the model
 ```bash
-LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python train_multitalker_aws.py \
+PYTHONPATH=. LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python scripts/train/train_multitalker_aws.py \
     --overrides conf/multitalker_finetune_overrides_aws_cmltts_pt.yaml \
     --train_cuts Data/CML_Corpus/multitalker_train_data/train_cuts.jsonl.gz \
     --val_cuts Data/CML_Corpus/multitalker_train_data/dev_cuts.jsonl.gz \
@@ -31,8 +34,8 @@ LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python train_m
 ### Tier 1: With respect to MFA ground truth
 
 ```bash
-LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python evaluate_checkpoint.py 
-    --overrides conf/multitalker_finetune_overrides_aws_cmltts.yaml 
+PYTHONPATH=. LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python scripts/evaluate/evaluate_checkpoint.py 
+    --overrides conf/multitalker_finetune_overrides_aws_cmltts_pt.yaml 
     --checkpoint "multitalker_finetune_experiments/multitalker_pt_cmltts_aws/2026-08-18_02-52-30/checkpoints/multitalker_pt_cmltts_aws--val_wer=0.5244-epoch=44.ckpt"  
     --test_cuts Data/CML_Corpus/multitalker_train_data/test_cuts.jsonl.gz 
 ```
@@ -51,8 +54,8 @@ PYTHONPATH=. LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" p
     --output_dir Data/CML_Corpus/multitalker_train_data/test_pooled_sortformer_preds
 
 # 3. Then the Tier 2 DER -reporting evaluation script.
-python evaluate_checkpoint_sortformer_conditioned.py \
-    --overrides conf/multitalker_finetune_overrides_aws_cmltts.yaml \
+PYTHONPATH=. LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python scripts/evaluate/evaluate_checkpoint_sortformer_conditioned.py \
+    --overrides conf/multitalker_finetune_overrides_aws_cmltts_pt.yaml \
     --checkpoint "multitalker_finetune_experiments/multitalker_pt_cmltts_aws/2026-08-18_02-52-30/checkpoints/multitalker_pt_cmltts_aws--val_wer=0.5244-epoch=44.ckpt" \
     --ref_dir Data/CML_Corpus/multitalker_train_data/test_pooled \  
     --pred_dir Data/CML_Corpus/multitalker_train_data/test_pooled_sortformer_preds \   
@@ -64,3 +67,5 @@ python evaluate_checkpoint_sortformer_conditioned.py \
 ```bash
 
 ```
+
+Note: The imports - PYTHONPATH=. and LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib", were quick fixes to work on my system. You may not need them. There would be a better and neater way to deal with this. Feel free to update accordingly.

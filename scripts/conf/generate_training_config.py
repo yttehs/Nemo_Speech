@@ -120,6 +120,7 @@ def main():
     print(f"  exp_manager.name: {args.exp_name}")
     resume_log_dir_value = "null" if args.resume_from_dir is None else args.resume_from_dir
     print(f"  exp_manager.explicit_log_dir: {resume_log_dir_value}")
+    print(f"  batch_duration (all three data blocks): {args.batch_duration:g}")
 
     template_text = args.template.read_text(encoding="utf-8")
     filled = (
@@ -130,10 +131,12 @@ def main():
         .replace("__WARMUP_STEPS__", str(warmup_steps))
         .replace("__EXP_NAME__", args.exp_name)
         .replace("__RESUME_LOG_DIR__", resume_log_dir_value)
+        .replace("__BATCH_DURATION__", f"{args.batch_duration:g}")
     )
 
     remaining = [tok for tok in ["__MAX_DURATION_FLOAT__", "__MAX_DURATION_INT__", "__MAX_STEPS__",
-                                  "__WARMUP_STEPS__", "__EXP_NAME__", "__RESUME_LOG_DIR__"] if tok in filled]
+                                  "__WARMUP_STEPS__", "__EXP_NAME__", "__RESUME_LOG_DIR__",
+                                  "__BATCH_DURATION__"] if tok in filled]
     if remaining:
         raise SystemExit(f"ERROR: placeholder(s) {remaining} still present after substitution -- "
                           f"the template may have changed without this script being updated to match.")

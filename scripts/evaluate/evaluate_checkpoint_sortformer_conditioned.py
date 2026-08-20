@@ -30,7 +30,7 @@ remains the one that isolates ASR quality from the diarization confound entirely
 Run run_sortformer_batch.py on test_pooled FIRST to get predicted RTTMs.
 
 Usage:
-    python evaluate_checkpoint_sortformer_conditioned.py \
+    python scripts/evaluate/evaluate_checkpoint_sortformer_conditioned.py \
         --overrides conf/multitalker_finetune_overrides_aws.yaml \
         --checkpoint ".../multitalker_pt_adapter_aws--val_wer=0.6957-epoch=46.ckpt" \
         --ref_dir /path/to/test_pooled \
@@ -54,7 +54,7 @@ ap.add_argument("--dummy_cuts_path", required=True,
                  help="Any real, valid *_cuts.jsonl.gz file from training (e.g. test_cuts.jsonl.gz) -- "
                       "needed only because NeMo validates train_ds/validation_ds/test_ds as real "
                       "manifests at model construction time, even though this script never uses them.")
-ap.add_argument("--collar", type=float, default=0.25)
+ap.add_argument("--collar", type=float, default=0.01)
 args = ap.parse_args()
 
 
