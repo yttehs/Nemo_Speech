@@ -1,6 +1,9 @@
 ## Copy FastMSS prepared data
+
+```bash
 cp -r /data/home/vishwas/Workspace/FastMSS/Data_Spanish/multitalker_train_data Data_Spanish/.
 cp -r /data/home/vishwas/Workspace/FastMSS/Data_Spanish/fastmss_final Data_Spanish/.
+```
 
 ## Generate the configuration yaml file
 ```bash
@@ -16,6 +19,15 @@ python scripts/conf/generate_training_config.py \
     --batch_duration 60
 
 # You can update the batch duration if you get GPU memeory issues.
+```
+
+## If needed, you can recalculate the Train/Dev/Test statistics 
+
+```bash
+python scripts/statistics/compute_overlap_stats.py \
+    --cuts Spanish_train=Data_Spanish/multitalker_train_data/train_cuts.jsonl.gz \
+    --cuts Spanish_test=Data_Spanish/multitalker_train_data/test_cuts.jsonl.gz \
+    --cuts Spanish_dev=Data_Spanish/multitalker_train_data/dev_cuts.jsonl.gz
 ```
 
 ## Train the model

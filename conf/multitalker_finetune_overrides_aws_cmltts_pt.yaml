@@ -4,13 +4,16 @@
 # encoder/decoder/joint architecture always matches the pretrained weights exactly.
 # Only multitalker-specific, data, and training keys are set here.
 #
-# CML-TTS-PT version -- copied from multitalker_finetune_overrides_aws.yaml (the
-# VoxForge-PT run) rather than edited in place, so both runs stay independently
-# reproducible. Same AWS L40S hardware assumptions carry over unchanged (single GPU,
-# 46GB VRAM, 4 CPU cores, 22GB system RAM). Two things recomputed for this dataset
-# specifically, both flagged inline below: exp_manager.name (was colliding with the
-# VoxForge run's own checkpoint directory) and optim.sched.max_steps (was computed
-# for VoxForge's 525 train cuts, not this dataset's 700).
+# TEMPLATE -- do not use this file directly. The four values below marked with
+# __PLACEHOLDER__ tokens are dataset-scale-dependent and get filled in automatically
+# by generate_training_config.py, which measures your actual combined train/dev/test
+# cutsets rather than reusing another language/dataset's numbers. Every prior baseline
+# (VoxForge-PT, CML-TTS-PT, CML-TTS-ES) needed its own values here specifically
+# because these depend on real session-duration distributions and session counts that
+# differ across datasets -- see generate_training_config.py's own docstring for the
+# exact reasoning and formulas. Everything else in this file (architecture, optimizer,
+# AWS L40S hardware assumptions -- single GPU, 46GB VRAM, 4 CPU cores, 22GB system
+# RAM) is dataset-independent and shared across all baselines run against this recipe.
 
 model:
   # --- Speaker kernel injection (SpeakerKernelMixin) ---
@@ -30,22 +33,22 @@ model:
     cuts_path: ???  # set via CLI override or fill in: /path/to/train_cuts.jsonl.gz
     num_speakers: 4
     min_duration: 1.0
-    max_duration: 60.0        # CHANGED from 30.0 -- confirmed the hard way: with 30.0, ALL 700
-                               # train sessions were silently filtered out (100% exceeded it, since
-                               # FastMSS's duration=30 is a MINIMUM not a cap -- real sessions
-                               # measured min=30.0s/mean=32.5s/max=52.3s). 60.0 gives headroom above
-                               # the observed max rather than just clearing it exactly.
+    max_duration: 60.0      # auto-computed: see generate_training_config.py
     max_tps: 20.0             # relaxed from 8 (1080Ti) -- that was guarding against
                                # target-text-density OOM spikes on an 8GB card. Still worth
                                # some bound as a data-quality guard, just not as tight.
     shuffle: true
     use_bucketing: true
     num_buckets: 10           # starting point given cut lengths span ~1-30s; not tuned
-    batch_duration: 90        # relaxed substantially given ~5.75x more VRAM than the 1080Ti
-                               # (8GB -> 46GB). This is a fresh starting guess, NOT measured
-                               # against actual L40S memory usage -- watch nvidia-smi on the
-                               # first run and adjust up/down from here.
-    quadratic_duration: 60    # CHANGED from 30 to match the new max_duration -- same reasoning
+    batch_duration: 90  # auto-filled from --batch_duration, default 90 -- this
+                               # was always an untested guess (see generate_training_config.py's
+                               # own docstring), confirmed the hard way to be too aggressive when
+                               # sharing a GPU with another process AND a dataset with a long
+                               # session-duration tail (Spanish: up to 81.1s). Lower this via
+                               # --batch_duration if you hit CUDA OOM -- doing so through the
+                               # generator (not a manual edit) keeps max_steps/warmup_steps
+                               # correctly recomputed for the new value automatically.
+    quadratic_duration: 60  # matches max_duration above, auto-computed
                                # as before, this exists specifically to de-prioritize batching very
                                # long cuts together, and needs to track whatever the real cap is
     num_workers: 2            # explicit given only 4 CPU cores total on this machine --
@@ -57,11 +60,11 @@ model:
     cuts_path: ???  # /path/to/val_cuts.jsonl.gz
     num_speakers: 4
     min_duration: 1.0
-    max_duration: 60.0        # CHANGED from 30.0, same reasoning as train_ds above
+    max_duration: 60.0      # matches train_ds, auto-computed
     max_tps: 20.0
     shuffle: false
     use_bucketing: false      # no need to bucket a small, one-pass validation set
-    batch_duration: 90
+    batch_duration: 90  # matches train_ds, auto-filled
     num_workers: 0            # CHANGED from 2 -- multi-worker splitting crashed with "max() iterable
                                # argument is empty" during sanity check on this 100-session dataset
                                # (each DataLoader worker gets its own independently-seeded randomized
@@ -78,11 +81,11 @@ model:
     cuts_path: ???  # /path/to/test_cuts.jsonl.gz
     num_speakers: 4
     min_duration: 1.0
-    max_duration: 60.0        # CHANGED from 30.0, same reasoning as train_ds above
+    max_duration: 60.0      # matches train_ds, auto-computed
     max_tps: 20.0
     shuffle: false
     use_bucketing: false
-    batch_duration: 90
+    batch_duration: 90  # matches train_ds, auto-filled
     num_workers: 0            # CHANGED from 2, same reasoning as validation_ds above
 
   decoding:
@@ -90,6 +93,20 @@ model:
     # attribute name joint_fused_batch_size, which only exists after NeMo reads this in).
     # Relaxed from 1 (1080Ti, memory-constrained) back up given the much larger VRAM budget.
     fused_batch_size: 8
+    greedy:
+      use_cuda_graph_decoder: false  # Added after a real CUDA OOM investigation: NeMo's own
+        # logs show "CUDA graphs disabled/enabled for ...GreedyBatchedTDTInfer" toggling every
+        # single train<->validate transition (the decoder gets rebuilt via
+        # change_decoding_strategy() each time, re-enabling graphs). Capturing a new CUDA graph
+        # needs its own buffers allocated before the old ones are released -- a plausible
+        # transient memory spike right at that transition. Confirmed NOT explained by batch
+        # size: OOM recurred at batch_duration=90, 60, AND 45 despite ~90% smaller batches and
+        # IDENTICAL steady-state GPU memory (~20GB) across all three -- ruling out batch
+        # composition as the driver. This flag is confirmed to exist in NeMo (real fix for the
+        # same decoder class in an unrelated project), but NOT YET independently verified as
+        # the actual fix in THIS codebase/version -- if OmegaConf rejects this key or training
+        # still OOMs at the same transition after adding it, that's real information, not a
+        # dead end; report back either way.
 
   optim:
     name: adamw
@@ -100,16 +117,13 @@ model:
     betas: [0.9, 0.98]
     sched:
       name: WarmupAnnealing
-      warmup_steps: 400      # scaled proportionally with max_steps below (was 200 for VoxForge's
-                              # ~3000 max_steps -- same ~6.7% ratio, not independently tuned)
-      max_steps: 6300         # recomputed for THIS dataset, not carried over from VoxForge:
-                              # 700 train sessions, 6.31h total -> ~32.45s avg session duration
-                              # (all sessions target ~30s, unlike VoxForge's more varied ~20s avg)
-                              # -> 90s batch / 32.45s ~= 2.77 cuts/batch -> ~253 steps/epoch
-                              # * 50 epochs ~= 12,650, halved for accumulate_grad_batches=2 ~= 6325,
-                              # rounded to 6300. Still approximate for the same reason as before --
-                              # Lhotse's dynamic batching means actual cuts/batch varies. Watch the
-                              # real steps/epoch NeMo reports early in training and revisit this.
+      warmup_steps: 401   # proportional to max_steps below, auto-computed
+      max_steps: 6313         # auto-computed from your real session count and duration
+                              # distribution -- see generate_training_config.py for the exact
+                              # formula. Still approximate even after computation -- Lhotse's
+                              # dynamic batching means actual cuts/batch varies. Watch the real
+                              # steps/epoch NeMo reports early in training and revisit if it's
+                              # far off from what the generator printed.
       min_lr: 1e-6
 
 trainer:
@@ -142,11 +156,17 @@ trainer:
 
 exp_manager:
   exp_dir: ./multitalker_finetune_experiments
-  name: multitalker_pt_cmltts_aws   # CHANGED from multitalker_pt_adapter_aws (the VoxForge run's
-                                     # name) -- exp_manager_cfg is read straight from this file with
-                                     # no CLI override, so reusing that name would risk writing this
-                                     # run's checkpoints into the VoxForge run's own experiment
-                                     # directory, potentially overwriting it.
+  name: multitalker_pt_cmltts_aws   # each dataset/language needs its own unique name here -- exp_manager_cfg
+                        # is read straight from this file with no CLI override, so two runs
+                        # sharing a name would write into the same experiment directory and risk
+                        # overwriting each other's checkpoints.
+  explicit_log_dir: null  # null by default (generate_training_config.py's own
+                        # default) -- with resume_if_exists true from the START of a run (see
+                        # below), NeMo never creates a timestamped version folder in the first
+                        # place, so a fresh run never needs this set. Only pass --resume_from_dir
+                        # to the generator when actually resuming an interrupted run that predates
+                        # this template fix (one already has a timestamped folder from before
+                        # resume_if_exists was active) -- see that script's own docstring.
   create_checkpoint_callback: true
   checkpoint_callback_params:
     monitor: val_wer   # val_loss is never logged -- gated behind compute_eval_loss in
@@ -156,4 +176,23 @@ exp_manager:
                         # anyway -- direct transcription accuracy, not a loss proxy.
     mode: min           # lower WER is still better, same direction as loss
     save_top_k: 3
+    save_last: true     # keeps an explicit "most recent state" checkpoint separate from the
+                        # top-3-by-val_wer ones -- without this, resuming after an interruption
+                        # could silently roll back to an earlier, better-scoring epoch instead of
+                        # continuing from where training actually stopped, since save_top_k alone
+                        # only keeps checkpoints by quality ranking, not recency.
+  resume_if_exists: true  # without this, exp_manager never looks for existing checkpoints at
+                        # all -- trainer.fit(model) just starts fresh every time, silently
+                        # ignoring anything already saved from an interrupted prior run. Set from
+                        # the START here specifically so a first run's directory layout is already
+                        # resume-compatible if it's ever interrupted, rather than needing this
+                        # patched in after the fact (which creates the explicit_log_dir mismatch
+                        # documented above).
+  resume_ignore_no_checkpoint: true  # CRITICAL alongside resume_if_exists -- without this,
+                        # resume_if_exists=true means "a checkpoint MUST exist", and exp_manager
+                        # raises NotFoundError on a genuinely fresh run with nothing to resume from
+                        # yet (confirmed the hard way: this broke a clean first run using an
+                        # earlier version of this template that had resume_if_exists without this).
+                        # With this set, "no checkpoint found" is correctly treated as "start
+                        # fresh" instead of an error.
   create_tensorboard_logger: true

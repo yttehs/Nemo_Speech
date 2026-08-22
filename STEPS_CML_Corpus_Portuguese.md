@@ -1,6 +1,9 @@
 ## Copy FastMSS prepared data
+
+```bash
 cp -r /data/home/vishwas/Workspace/FastMSS/Data/multitalker_train_data Data/CML_Corpus/.
 cp -r /data/home/vishwas/Workspace/FastMSS/Data/fastmss_final Data/.
+```
 
 ## Generate the configuration yaml file
 ```bash
@@ -17,6 +20,16 @@ python scripts/conf/generate_training_config.py \
 
 # You can update the batch duration if you get GPU memeory issues.
 ```
+
+## If needed, you can recalculate the Train/Dev/Test statistics 
+
+```bash
+python scripts/statistics/compute_overlap_stats.py \
+    --cuts Portuguese_train=Data/CML_Corpus/multitalker_train_data/train_cuts.jsonl.gz \
+    --cuts Portuguese_test=Data/CML_Corpus/multitalker_train_data/test_cuts.jsonl.gz \
+    --cuts Portuguese_dev=Data/CML_Corpus/multitalker_train_data/dev_cuts.jsonl.gz
+```
+
 
 ## Train the model
 ```bash
