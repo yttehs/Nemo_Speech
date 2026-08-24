@@ -55,6 +55,14 @@ ap.add_argument("--dummy_cuts_path", required=True,
                       "needed only because NeMo validates train_ds/validation_ds/test_ds as real "
                       "manifests at model construction time, even though this script never uses them.")
 ap.add_argument("--collar", type=float, default=0.01)
+ap.add_argument("--use_purity_weighted_targets", action="store_true",
+                 help="MUST match whatever the checkpoint being evaluated was actually trained "
+                      "with (same flag name as generate_training_config.py) -- evaluating a "
+                      "purity-trained model with hard binary masks, or vice versa, is a genuine "
+                      "train/test mismatch, not a neutral default.")
+ap.add_argument("--lambda_overlap_weight", type=float, default=0.5,
+                 help="Only has any effect when --use_purity_weighted_targets is set. Must match "
+                      "the value the checkpoint was trained with.")
 args = ap.parse_args()
 
 
@@ -122,7 +130,9 @@ def main():
                 continue
             try:
                 spk_target, bg_spk_target = build_mask_for_speaker(
-                    wav_path, sortformer_segments, target_speaker=sortformer_speaker
+                    wav_path, sortformer_segments, target_speaker=sortformer_speaker,
+                    use_purity_weighted_targets=args.use_purity_weighted_targets,
+                    lambda_overlap_weight=args.lambda_overlap_weight,
                 )
             except ValueError:
                 continue

@@ -32,26 +32,26 @@ model:
     use_lhotse: true
     cuts_path: ???  # set via CLI override or fill in: /path/to/train_cuts.jsonl.gz
     num_speakers: 4
-    use_purity_weighted_targets: __USE_PURITY_WEIGHTED_TARGETS__  # auto-filled, default false
+    use_purity_weighted_targets: true  # auto-filled, default false
         # (preserves original binary spk_target/bg_spk_target behavior). When true, replaces
         # the hard {0,1} mask with a continuous STNO-derived purity weight -- see
         # audio_to_text_lhotse_speaker.py's __getitem__ for the exact derivation. Requires
         # soft_label=True internally to get real per-speaker probabilities; that's handled
         # automatically, tied to this same flag.
-    lambda_overlap_weight: __LAMBDA_OVERLAP_WEIGHT__  # auto-filled, default 0.5. Only has any
+    lambda_overlap_weight: 0.25  # auto-filled, default 0.5. Only has any
         # effect when use_purity_weighted_targets is true. speaker_target = P_T + lambda*P_O,
         # bg_target = (1-lambda)*P_O + P_N -- lambda=0 counts only pure (non-overlapped) target
         # frames at full weight; closer to 1 treats overlapped frames closer to today's binary
         # full-weight behavior. Not independently tuned -- a real hyperparameter to sweep.
     min_duration: 1.0
-    max_duration: __MAX_DURATION_FLOAT__      # auto-computed: see generate_training_config.py
+    max_duration: 60.0      # auto-computed: see generate_training_config.py
     max_tps: 20.0             # relaxed from 8 (1080Ti) -- that was guarding against
                                # target-text-density OOM spikes on an 8GB card. Still worth
                                # some bound as a data-quality guard, just not as tight.
     shuffle: true
     use_bucketing: true
     num_buckets: 10           # starting point given cut lengths span ~1-30s; not tuned
-    batch_duration: __BATCH_DURATION__  # auto-filled from --batch_duration, default 90 -- this
+    batch_duration: 90  # auto-filled from --batch_duration, default 90 -- this
                                # was always an untested guess (see generate_training_config.py's
                                # own docstring), confirmed the hard way to be too aggressive when
                                # sharing a GPU with another process AND a dataset with a long
@@ -59,7 +59,7 @@ model:
                                # --batch_duration if you hit CUDA OOM -- doing so through the
                                # generator (not a manual edit) keeps max_steps/warmup_steps
                                # correctly recomputed for the new value automatically.
-    quadratic_duration: __MAX_DURATION_INT__  # matches max_duration above, auto-computed
+    quadratic_duration: 60  # matches max_duration above, auto-computed
                                # as before, this exists specifically to de-prioritize batching very
                                # long cuts together, and needs to track whatever the real cap is
     num_workers: 2            # explicit given only 4 CPU cores total on this machine --
@@ -70,14 +70,14 @@ model:
     use_lhotse: true
     cuts_path: ???  # /path/to/val_cuts.jsonl.gz
     num_speakers: 4
-    use_purity_weighted_targets: __USE_PURITY_WEIGHTED_TARGETS__  # matches train_ds, auto-filled
-    lambda_overlap_weight: __LAMBDA_OVERLAP_WEIGHT__  # matches train_ds, auto-filled
+    use_purity_weighted_targets: true  # matches train_ds, auto-filled
+    lambda_overlap_weight: 0.25  # matches train_ds, auto-filled
     min_duration: 1.0
-    max_duration: __MAX_DURATION_FLOAT__      # matches train_ds, auto-computed
+    max_duration: 60.0      # matches train_ds, auto-computed
     max_tps: 20.0
     shuffle: false
     use_bucketing: false      # no need to bucket a small, one-pass validation set
-    batch_duration: __BATCH_DURATION__  # matches train_ds, auto-filled
+    batch_duration: 90  # matches train_ds, auto-filled
     num_workers: 0            # CHANGED from 2 -- multi-worker splitting crashed with "max() iterable
                                # argument is empty" during sanity check on this 100-session dataset
                                # (each DataLoader worker gets its own independently-seeded randomized
@@ -93,14 +93,14 @@ model:
     use_lhotse: true
     cuts_path: ???  # /path/to/test_cuts.jsonl.gz
     num_speakers: 4
-    use_purity_weighted_targets: __USE_PURITY_WEIGHTED_TARGETS__  # matches train_ds, auto-filled
-    lambda_overlap_weight: __LAMBDA_OVERLAP_WEIGHT__  # matches train_ds, auto-filled
+    use_purity_weighted_targets: true  # matches train_ds, auto-filled
+    lambda_overlap_weight: 0.25  # matches train_ds, auto-filled
     min_duration: 1.0
-    max_duration: __MAX_DURATION_FLOAT__      # matches train_ds, auto-computed
+    max_duration: 60.0      # matches train_ds, auto-computed
     max_tps: 20.0
     shuffle: false
     use_bucketing: false
-    batch_duration: __BATCH_DURATION__  # matches train_ds, auto-filled
+    batch_duration: 90  # matches train_ds, auto-filled
     num_workers: 0            # CHANGED from 2, same reasoning as validation_ds above
 
   decoding:
@@ -132,8 +132,8 @@ model:
     betas: [0.9, 0.98]
     sched:
       name: WarmupAnnealing
-      warmup_steps: __WARMUP_STEPS__   # proportional to max_steps below, auto-computed
-      max_steps: __MAX_STEPS__         # auto-computed from your real session count and duration
+      warmup_steps: 401   # proportional to max_steps below, auto-computed
+      max_steps: 6313         # auto-computed from your real session count and duration
                               # distribution -- see generate_training_config.py for the exact
                               # formula. Still approximate even after computation -- Lhotse's
                               # dynamic batching means actual cuts/batch varies. Watch the real
@@ -171,11 +171,11 @@ trainer:
 
 exp_manager:
   exp_dir: ./multitalker_finetune_experiments
-  name: __EXP_NAME__   # each dataset/language needs its own unique name here -- exp_manager_cfg
+  name: multitalker_pt_cmltts_purity_lam025_aws   # each dataset/language needs its own unique name here -- exp_manager_cfg
                         # is read straight from this file with no CLI override, so two runs
                         # sharing a name would write into the same experiment directory and risk
                         # overwriting each other's checkpoints.
-  explicit_log_dir: __RESUME_LOG_DIR__  # null by default (generate_training_config.py's own
+  explicit_log_dir: null  # null by default (generate_training_config.py's own
                         # default) -- with resume_if_exists true from the START of a run (see
                         # below), NeMo never creates a timestamped version folder in the first
                         # place, so a fresh run never needs this set. Only pass --resume_from_dir

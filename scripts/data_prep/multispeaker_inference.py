@@ -156,13 +156,24 @@ def enable_word_timestamps(model):
     model._word_timestamps_enabled = True
 
 
-def build_mask_for_speaker(wav_path, segments, target_speaker, num_speakers=4):
+def build_mask_for_speaker(wav_path, segments, target_speaker, num_speakers=4,
+                            use_purity_weighted_targets=False, lambda_overlap_weight=0.5):
     """
     Builds (spk_target, bg_spk_target) 1D tensors for ONE target speaker, using
     speaker_to_target() itself so mask construction exactly matches training.
 
     segments: list of (start, end, speaker) tuples -- ground truth OR Sortformer's
     predictions, doesn't matter which; this function doesn't care about the source.
+
+    use_purity_weighted_targets/lambda_overlap_weight: MUST match whatever the model
+    was actually trained with (see audio_to_text_lhotse_speaker.py's identically-named
+    train_ds/validation_ds/test_ds config keys) -- evaluating a purity-trained model
+    with hard binary masks (or vice versa) is a genuine train/test mismatch, not just a
+    missed optimization. Note: RTTM segments (Sortformer's predictions) carry no
+    continuous per-frame confidence, only discrete start/end boundaries -- soft_label's
+    continuous values here reflect boundary-alignment softening only (a segment edge
+    landing mid-ASR-frame), the same mechanism as training, just without genuine
+    diarization-confidence gradation since RTTM itself doesn't carry that.
     """
     recording = Recording.from_file(wav_path, recording_id="eval")
     supervisions = [
@@ -173,7 +184,8 @@ def build_mask_for_speaker(wav_path, segments, target_speaker, num_speakers=4):
     cut = MonoCut(id="eval", start=0.0, duration=recording.duration, channel=0,
                   recording=recording, supervisions=supervisions, custom={})
 
-    mask, texts = speaker_to_target(cut, num_speakers=num_speakers, return_text=True)
+    mask, texts = speaker_to_target(cut, num_speakers=num_speakers, return_text=True,
+                                     soft_label=use_purity_weighted_targets)
     mask = mask.transpose(0, 1)[: len(texts)]  # [num_real_speakers, num_frames], arrival order
 
     order = arrival_order(segments)
@@ -194,9 +206,27 @@ def build_mask_for_speaker(wav_path, segments, target_speaker, num_speakers=4):
             f"internally. Skipping this pair."
         )
 
-    spk_target = mask[idx]
-    bg_spk_target = (mask.sum(dim=0) - mask[idx] > 0).float()  # same OR-of-others logic as
-                                                                  # the dataset's bg_speaker_target
+    if use_purity_weighted_targets:
+        # Identical derivation to audio_to_text_lhotse_speaker.py's training-time logic --
+        # see test_purity_weighting.py for the shared correctness tests both paths rely on.
+        non_target_idx = [i for i in range(mask.shape[0]) if i != idx]
+        d_target = mask[idx]
+        if non_target_idx:
+            prod_others_silent = torch.prod(1 - mask[non_target_idx], dim=0)
+        else:
+            prod_others_silent = torch.ones_like(d_target)  # no other speakers at all in this session
+        p_t = d_target * prod_others_silent
+        p_o = d_target - p_t
+        p_silence = prod_others_silent * (1 - d_target)
+        p_n = 1 - p_silence - d_target
+
+        lam = lambda_overlap_weight
+        spk_target = p_t + lam * p_o
+        bg_spk_target = (1 - lam) * p_o + p_n
+    else:
+        spk_target = mask[idx]
+        bg_spk_target = (mask.sum(dim=0) - mask[idx] > 0).float()  # same OR-of-others logic as
+                                                                      # the dataset's bg_speaker_target
     return spk_target, bg_spk_target
 
 

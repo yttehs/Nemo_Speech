@@ -88,10 +88,37 @@ ap.add_argument("--resume_from_dir", default=None,
                       "already on by default in this template, so a fresh run's own eventual "
                       "interruption won't need this at all; NeMo will find its own checkpoints "
                       "automatically next time.")
+ap.add_argument("--use_purity_weighted_targets", action="store_true",
+                 help="Replace the hard {0,1} spk_target/bg_spk_target mask with a continuous "
+                      "STNO-derived purity weight (see audio_to_text_lhotse_speaker.py). Off by "
+                      "default, preserving exact original behavior -- this is a real architecture "
+                      "change to what the model trains against, not a tuning knob to leave on by "
+                      "habit. Applied consistently to train_ds/validation_ds/test_ds so a run can't "
+                      "end up training with purity weighting but evaluating without it.")
+ap.add_argument("--lambda_overlap_weight", type=float, default=0.5,
+                 help="Only has any effect when --use_purity_weighted_targets is set. "
+                      "speaker_target = P_T + lambda*P_O, bg_target = (1-lambda)*P_O + P_N. "
+                      "0.5 is an arbitrary starting point, not a tuned value -- treat as a real "
+                      "hyperparameter to sweep, same as any other.")
 args = ap.parse_args()
 
 
 def main():
+    expected_placeholders = ["__MAX_DURATION_FLOAT__", "__MAX_DURATION_INT__", "__MAX_STEPS__",
+                              "__WARMUP_STEPS__", "__EXP_NAME__", "__RESUME_LOG_DIR__",
+                              "__BATCH_DURATION__", "__USE_PURITY_WEIGHTED_TARGETS__",
+                              "__LAMBDA_OVERLAP_WEIGHT__"]
+    template_text = args.template.read_text(encoding="utf-8")
+    missing_from_template = [tok for tok in expected_placeholders if tok not in template_text]
+    if missing_from_template:
+        raise SystemExit(
+            f"ERROR: {args.template} is missing placeholder(s) {missing_from_template} -- this "
+            f"looks like a stale copy of the template predating one or more of these fields. "
+            f"Substituting into it would silently succeed while leaving the actual YAML value "
+            f"unchanged from whatever's hardcoded in this file, rather than using your "
+            f"--batch_duration (or other) argument. Get the current template before re-running."
+        )
+
     print("Loading cutsets to measure the real duration distribution...")
     train_cuts = list(CutSet.from_file(args.train_cuts))
     dev_cuts = list(CutSet.from_file(args.dev_cuts))
@@ -121,8 +148,9 @@ def main():
     resume_log_dir_value = "null" if args.resume_from_dir is None else args.resume_from_dir
     print(f"  exp_manager.explicit_log_dir: {resume_log_dir_value}")
     print(f"  batch_duration (all three data blocks): {args.batch_duration:g}")
+    print(f"  use_purity_weighted_targets (all three data blocks): {args.use_purity_weighted_targets}")
+    print(f"  lambda_overlap_weight (all three data blocks): {args.lambda_overlap_weight:g}")
 
-    template_text = args.template.read_text(encoding="utf-8")
     filled = (
         template_text
         .replace("__MAX_DURATION_FLOAT__", f"{max_duration:.1f}")
@@ -132,14 +160,15 @@ def main():
         .replace("__EXP_NAME__", args.exp_name)
         .replace("__RESUME_LOG_DIR__", resume_log_dir_value)
         .replace("__BATCH_DURATION__", f"{args.batch_duration:g}")
+        .replace("__USE_PURITY_WEIGHTED_TARGETS__", "true" if args.use_purity_weighted_targets else "false")
+        .replace("__LAMBDA_OVERLAP_WEIGHT__", f"{args.lambda_overlap_weight:g}")
     )
 
-    remaining = [tok for tok in ["__MAX_DURATION_FLOAT__", "__MAX_DURATION_INT__", "__MAX_STEPS__",
-                                  "__WARMUP_STEPS__", "__EXP_NAME__", "__RESUME_LOG_DIR__",
-                                  "__BATCH_DURATION__"] if tok in filled]
+    remaining = [tok for tok in expected_placeholders if tok in filled]
     if remaining:
         raise SystemExit(f"ERROR: placeholder(s) {remaining} still present after substitution -- "
-                          f"the template may have changed without this script being updated to match.")
+                          f"this shouldn't be reachable given the upfront check already passed; "
+                          f"please report this as a bug in the script.")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(filled, encoding="utf-8")

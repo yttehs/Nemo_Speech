@@ -15,8 +15,9 @@ python scripts/conf/generate_training_config.py \
     --dev_cuts Data/CML_Corpus/multitalker_train_data/dev_cuts.jsonl.gz \
     --test_cuts Data/CML_Corpus/multitalker_train_data/test_cuts.jsonl.gz \
     --exp_name multitalker_pt_cmltts_aws \
-    --output conf/multitalker_finetune_overrides_aws_cmltts_pt.yaml  
-    --batch_duration 90
+    --output conf/multitalker_finetune_overrides_aws_cmltts_pt.yaml \ 
+    --batch_duration 90 \
+    --use_purity_weighted_targets --lambda_overlap_weight 0.5
 
 # You can update the batch duration if you get GPU memeory issues.
 ```

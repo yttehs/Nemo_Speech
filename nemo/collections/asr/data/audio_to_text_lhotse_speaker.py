@@ -56,6 +56,12 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
         self.num_mel_frame_per_asr_frame = self.cfg.get('num_mel_frame_per_asr_frame', 8)
         self.fixed_spk_id = self.cfg.get('fixed_spk_id', None)
         self.inference_mode = self.cfg.get('inference_mode', False)
+        # Opt-in, defaults preserve exact current (binary mask) behavior -- critical since
+        # already-trained checkpoints (Portuguese, Spanish CML-TTS baselines) were trained
+        # and evaluated against the binary mask; silently changing the default here would
+        # invalidate those as a comparison baseline for anyone re-running their eval.
+        self.use_purity_weighted_targets = self.cfg.get('use_purity_weighted_targets', False)
+        self.lambda_overlap_weight = self.cfg.get('lambda_overlap_weight', 0.5)
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
 
@@ -76,14 +82,43 @@ class LhotseSpeechToTextSpkBpeDataset(torch.utils.data.Dataset):
                 num_sample_per_mel_frame=self.num_sample_per_mel_frame,
                 num_mel_frame_per_asr_frame=self.num_mel_frame_per_asr_frame,
                 return_text=True,
+                # soft_label=True is REQUIRED for purity weighting below -- without it,
+                # speaker_targets arrives already hard-binarized (0/1) and there is no
+                # real per-speaker activity probability left to derive STNO values from.
+                # When purity weighting is off, this has no effect on training: the
+                # binary-vs-soft-thresholded mask is later reproduced by construction
+                # (see the else branch below), so existing runs are unaffected.
+                soft_label=self.use_purity_weighted_targets,
             )
             speaker_targets = speaker_targets.transpose(0, 1)[: len(texts)]
 
             target_speaker_id = random.choice(range(len(texts)))
             non_target_speaker_ids = [i for i in range(len(texts)) if i != target_speaker_id]
             text = texts[target_speaker_id]
-            speaker_target = speaker_targets[target_speaker_id]
-            bg_speaker_target = speaker_targets[non_target_speaker_ids].sum(dim=0) > 0
+
+            if self.use_purity_weighted_targets:
+                # Derives STNO-style (Silence/Target/Non-target/Overlap) frame probabilities
+                # from each speaker's own boundary-softened activity probability d(s,t) =
+                # speaker_targets[s], using the same independence-assumption formula as
+                # DiCoW (Polok et al., "Diarization-Conditioned Whisper"):
+                #   P_S = prod_s(1 - d(s,t))                      -- nobody active
+                #   P_T = d(target,t) * prod_{s!=target}(1-d(s,t)) -- target active, alone
+                #   P_O = d(target,t) - P_T                        -- target active, not alone
+                #   P_N = (1 - P_S) - d(target,t)                  -- someone else active, target isn't
+                # These four sum to 1 by construction (verified in test_purity_weighting.py).
+                d_target = speaker_targets[target_speaker_id]
+                prod_others_silent = torch.prod(1 - speaker_targets[non_target_speaker_ids], dim=0)
+                p_t = d_target * prod_others_silent
+                p_o = d_target - p_t
+                p_silence = prod_others_silent * (1 - d_target)
+                p_n = 1 - p_silence - d_target
+
+                lam = self.lambda_overlap_weight
+                speaker_target = p_t + lam * p_o
+                bg_speaker_target = (1 - lam) * p_o + p_n
+            else:
+                speaker_target = speaker_targets[target_speaker_id]
+                bg_speaker_target = speaker_targets[non_target_speaker_ids].sum(dim=0) > 0
 
             tokens.append(torch.as_tensor(self.tokenizer(text, cut.supervisions[0].language)))
             spk_targets.append(speaker_target)
