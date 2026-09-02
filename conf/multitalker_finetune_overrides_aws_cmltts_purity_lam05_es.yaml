@@ -1,0 +1,213 @@
+# Override config for fine-tuning EncDecMultiTalkerRNNTBPEModel from a pretrained
+# Parakeet-TDT-0.6B-v3 checkpoint. This is NOT a standalone config -- it gets merged
+# ON TOP OF the pretrained model's own config in train_multitalker.py, so that the
+# encoder/decoder/joint architecture always matches the pretrained weights exactly.
+# Only multitalker-specific, data, and training keys are set here.
+#
+# TEMPLATE -- do not use this file directly. The four values below marked with
+# __PLACEHOLDER__ tokens are dataset-scale-dependent and get filled in automatically
+# by generate_training_config.py, which measures your actual combined train/dev/test
+# cutsets rather than reusing another language/dataset's numbers. Every prior baseline
+# (VoxForge-PT, CML-TTS-PT, CML-TTS-ES) needed its own values here specifically
+# because these depend on real session-duration distributions and session counts that
+# differ across datasets -- see generate_training_config.py's own docstring for the
+# exact reasoning and formulas. Everything else in this file (architecture, optimizer,
+# AWS L40S hardware assumptions -- single GPU, 46GB VRAM, 4 CPU cores, 22GB system
+# RAM) is dataset-independent and shared across all baselines run against this recipe.
+
+model:
+  # --- Speaker kernel injection (SpeakerKernelMixin) ---
+  # 'ff' is the only implemented kernel type in this codebase as of this repo snapshot
+  # (SpeakerKernelMixin.get_spk_kernel_class raises ValueError for anything else).
+  spk_kernel_type: 'ff'
+  # Which encoder layer indices get a kernel injected. [0] is the mixin's own default.
+  # Worth experimenting with later (e.g. injecting at multiple layers) once a single-layer
+  # baseline is confirmed working -- not a verified-optimal choice, just the safe starting point.
+  spk_kernel_layers: [0]
+  # bg_spk_targets is used unconditionally in training_step (spk_targets, bg_spk_targets
+  # = additional_args), so this needs to be true for the six-element batch shape to match.
+  add_bg_spk_kernel: true
+
+  train_ds:
+    use_lhotse: true
+    cuts_path: ???  # set via CLI override or fill in: /path/to/train_cuts.jsonl.gz
+    num_speakers: 4
+    use_purity_weighted_targets: true  # auto-filled, default false
+        # (preserves original binary spk_target/bg_spk_target behavior). When true, replaces
+        # the hard {0,1} mask with a continuous STNO-derived purity weight -- see
+        # audio_to_text_lhotse_speaker.py's __getitem__ for the exact derivation. Requires
+        # soft_label=True internally to get real per-speaker probabilities; that's handled
+        # automatically, tied to this same flag.
+    lambda_overlap_weight: 0.5  # auto-filled, default 0.5. Only has any
+        # effect when use_purity_weighted_targets is true. speaker_target = P_T + lambda*P_O,
+        # bg_target = (1-lambda)*P_O + P_N -- lambda=0 counts only pure (non-overlapped) target
+        # frames at full weight; closer to 1 treats overlapped frames closer to today's binary
+        # full-weight behavior. Not independently tuned -- a real hyperparameter to sweep.
+    min_duration: 1.0
+    max_duration: 70.0      # auto-computed: see generate_training_config.py
+    max_tps: 20.0             # relaxed from 8 (1080Ti) -- that was guarding against
+                               # target-text-density OOM spikes on an 8GB card. Still worth
+                               # some bound as a data-quality guard, just not as tight.
+    shuffle: true
+    use_bucketing: true
+    num_buckets: 10           # starting point given cut lengths span ~1-30s; not tuned
+    batch_duration: 90  # auto-filled from --batch_duration, default 90 -- this
+                               # was always an untested guess (see generate_training_config.py's
+                               # own docstring), confirmed the hard way to be too aggressive when
+                               # sharing a GPU with another process AND a dataset with a long
+                               # session-duration tail (Spanish: up to 81.1s). Lower this via
+                               # --batch_duration if you hit CUDA OOM -- doing so through the
+                               # generator (not a manual edit) keeps max_steps/warmup_steps
+                               # correctly recomputed for the new value automatically.
+    quadratic_duration: 70  # matches max_duration above, auto-computed
+                               # as before, this exists specifically to de-prioritize batching very
+                               # long cuts together, and needs to track whatever the real cap is
+    num_workers: 2            # explicit given only 4 CPU cores total on this machine --
+                               # worth being deliberate here rather than relying on defaults
+                               # tuned for a more CPU-abundant original training setup
+
+  validation_ds:
+    use_lhotse: true
+    cuts_path: ???  # /path/to/val_cuts.jsonl.gz
+    num_speakers: 4
+    use_purity_weighted_targets: true  # matches train_ds, auto-filled
+    lambda_overlap_weight: 0.5  # matches train_ds, auto-filled
+    min_duration: 1.0
+    max_duration: 70.0      # matches train_ds, auto-computed
+    max_tps: 20.0
+    shuffle: false
+    use_bucketing: false      # no need to bucket a small, one-pass validation set
+    batch_duration: 90  # matches train_ds, auto-filled
+    num_workers: 0            # CHANGED from 2 -- multi-worker splitting crashed with "max() iterable
+                               # argument is empty" during sanity check on this 100-session dataset
+                               # (each DataLoader worker gets its own independently-seeded randomized
+                               # batching pass; with duration-based dynamic batching rather than a
+                               # fixed cut count, workers can end up with different total batch counts,
+                               # and PyTorch's round-robin worker scheme then asks an exhausted worker
+                               # for a batch it doesn't have). num_workers=0 loads synchronously in the
+                               # main process instead, sidestepping the whole cross-worker split entirely
+                               # -- negligible cost here since validation only runs once per epoch check
+                               # on a small set, not continuously like training.
+
+  test_ds:
+    use_lhotse: true
+    cuts_path: ???  # /path/to/test_cuts.jsonl.gz
+    num_speakers: 4
+    use_purity_weighted_targets: true  # matches train_ds, auto-filled
+    lambda_overlap_weight: 0.5  # matches train_ds, auto-filled
+    min_duration: 1.0
+    max_duration: 70.0      # matches train_ds, auto-computed
+    max_tps: 20.0
+    shuffle: false
+    use_bucketing: false
+    batch_duration: 90  # matches train_ds, auto-filled
+    num_workers: 0            # CHANGED from 2, same reasoning as validation_ds above
+
+  decoding:
+    # Confirmed exact YAML key from the RNNTBPEDecodingConfig dataclass (NOT the Python
+    # attribute name joint_fused_batch_size, which only exists after NeMo reads this in).
+    # Relaxed from 1 (1080Ti, memory-constrained) back up given the much larger VRAM budget.
+    fused_batch_size: 8
+    greedy:
+      use_cuda_graph_decoder: false  # Added after a real CUDA OOM investigation: NeMo's own
+        # logs show "CUDA graphs disabled/enabled for ...GreedyBatchedTDTInfer" toggling every
+        # single train<->validate transition (the decoder gets rebuilt via
+        # change_decoding_strategy() each time, re-enabling graphs). Capturing a new CUDA graph
+        # needs its own buffers allocated before the old ones are released -- a plausible
+        # transient memory spike right at that transition. Confirmed NOT explained by batch
+        # size: OOM recurred at batch_duration=90, 60, AND 45 despite ~90% smaller batches and
+        # IDENTICAL steady-state GPU memory (~20GB) across all three -- ruling out batch
+        # composition as the driver. This flag is confirmed to exist in NeMo (real fix for the
+        # same decoder class in an unrelated project), but NOT YET independently verified as
+        # the actual fix in THIS codebase/version -- if OmegaConf rejects this key or training
+        # still OOMs at the same transition after adding it, that's real information, not a
+        # dead end; report back either way.
+
+  optim:
+    name: adamw
+    lr: 1e-4              # conservative starting point for adapter-only fine-tuning --
+                            # the paper's 3e-4 peak LR was for full/larger-scale training runs,
+                            # not directly transferable to this much smaller adapter-only setup
+    weight_decay: 1e-3
+    betas: [0.9, 0.98]
+    sched:
+      name: WarmupAnnealing
+      warmup_steps: 805   # proportional to max_steps below, auto-computed
+      max_steps: 12672         # auto-computed from your real session count and duration
+                              # distribution -- see generate_training_config.py for the exact
+                              # formula. Still approximate even after computation -- Lhotse's
+                              # dynamic batching means actual cuts/batch varies. Watch the real
+                              # steps/epoch NeMo reports early in training and revisit if it's
+                              # far off from what the generator printed.
+      min_lr: 1e-6
+
+trainer:
+  devices: 1                # single L40S -- no DDP needed
+  accelerator: gpu
+  logger: false             # exp_manager sets up its own logger (create_tensorboard_logger
+                            # below); Lightning's own default logger must be disabled or
+                            # exp_manager refuses to proceed, to avoid double-logging
+  enable_checkpointing: false  # same reasoning -- exp_manager sets up its own ModelCheckpoint
+                                # (create_checkpoint_callback below); Lightning's default one
+                                # must be disabled or exp_manager refuses to proceed
+  precision: 32              # full fp32 given the much larger VRAM budget -- removes an
+                            # entire category of precision-related complexity we hit on
+                            # the 1080Ti (the TDT loss's own force_float32 was always
+                            # independent of this setting anyway). L40S's Tensor Cores
+                            # still auto-accelerate eligible ops via TF32, so this isn't
+                            # as slow as pure fp32 would be on non-Ampere/Ada hardware.
+  max_epochs: 50            # generous upper bound; with only ~525 train cuts but a
+                            # different random target speaker sampled every __getitem__
+                            # call, effective example diversity per epoch is higher than
+                            # the raw cut count suggests -- watch val_loss and stop early
+  val_check_interval: 1.0
+  accumulate_grad_batches: 2  # kept per your call -- simulates a larger effective batch
+                                # size without needing a second GPU. Combined with the much
+                                # larger batch_duration above, effective batch size here is
+                                # substantially bigger than anything run on the 1080Ti --
+                                # worth watching training stability given that combined effect.
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+
+exp_manager:
+  exp_dir: ./multitalker_finetune_experiments
+  name: multitalker_es_cmltts_purity_lam050_aws   # each dataset/language needs its own unique name here -- exp_manager_cfg
+                        # is read straight from this file with no CLI override, so two runs
+                        # sharing a name would write into the same experiment directory and risk
+                        # overwriting each other's checkpoints.
+  explicit_log_dir: null  # null by default (generate_training_config.py's own
+                        # default) -- with resume_if_exists true from the START of a run (see
+                        # below), NeMo never creates a timestamped version folder in the first
+                        # place, so a fresh run never needs this set. Only pass --resume_from_dir
+                        # to the generator when actually resuming an interrupted run that predates
+                        # this template fix (one already has a timestamped folder from before
+                        # resume_if_exists was active) -- see that script's own docstring.
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: val_wer   # val_loss is never logged -- gated behind compute_eval_loss in
+                        # rnnt_models.py's validation_pass, which isn't set in this config.
+                        # val_wer IS confirmed logged (visible in the actual crash's metric
+                        # list), and is arguably the more meaningful metric for an ASR task
+                        # anyway -- direct transcription accuracy, not a loss proxy.
+    mode: min           # lower WER is still better, same direction as loss
+    save_top_k: 3
+    save_last: true     # keeps an explicit "most recent state" checkpoint separate from the
+                        # top-3-by-val_wer ones -- without this, resuming after an interruption
+                        # could silently roll back to an earlier, better-scoring epoch instead of
+                        # continuing from where training actually stopped, since save_top_k alone
+                        # only keeps checkpoints by quality ranking, not recency.
+  resume_if_exists: true  # without this, exp_manager never looks for existing checkpoints at
+                        # all -- trainer.fit(model) just starts fresh every time, silently
+                        # ignoring anything already saved from an interrupted prior run. Set from
+                        # the START here specifically so a first run's directory layout is already
+                        # resume-compatible if it's ever interrupted, rather than needing this
+                        # patched in after the fact (which creates the explicit_log_dir mismatch
+                        # documented above).
+  resume_ignore_no_checkpoint: true  # CRITICAL alongside resume_if_exists -- without this,
+                        # resume_if_exists=true means "a checkpoint MUST exist", and exp_manager
+                        # raises NotFoundError on a genuinely fresh run with nothing to resume from
+                        # yet (confirmed the hard way: this broke a clean first run using an
+                        # earlier version of this template that had resume_if_exists without this).
+                        # With this set, "no checkpoint found" is correctly treated as "start
+                        # fresh" instead of an error.
+  create_tensorboard_logger: true
