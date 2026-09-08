@@ -1,3 +1,8 @@
+# Note
+```bash
+I guess I have by mistake deleted the "Data" folder with the portuguese train data. For now I am recreating "Data_Portuguese", but with only the newly created (youtube based) test set. You will have to re create the other folders in the Data folder. Since the models trained using the initial data folder are present, for now creating the data folder is not a priority.
+```
+
 ## Copy FastMSS prepared data
 
 ```bash

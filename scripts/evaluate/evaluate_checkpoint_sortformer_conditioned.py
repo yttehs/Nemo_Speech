@@ -41,7 +41,10 @@ import json
 from pathlib import Path
 
 from scripts.data_prep.der_scorer import score_der
-from scripts.data_prep.multispeaker_inference import load_model, parse_rttm, build_mask_for_speaker, transcribe_with_mask
+from scripts.data_prep.multispeaker_inference import (
+    load_model, parse_rttm, build_mask_for_speaker, transcribe_with_mask,
+    num_mel_frame_per_asr_frame_from_model,
+)
 from scripts.data_prep.wer_scorer import word_error_rate
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -63,6 +66,24 @@ ap.add_argument("--use_purity_weighted_targets", action="store_true",
 ap.add_argument("--lambda_overlap_weight", type=float, default=0.5,
                  help="Only has any effect when --use_purity_weighted_targets is set. Must match "
                       "the value the checkpoint was trained with.")
+ap.add_argument("--char_level_scoring", action="store_true",
+                 help="Score with character-level edit distance instead of whitespace-delimited "
+                      "word-level. Required for CJK languages (Chinese, etc.), which don't use "
+                      "spaces between words or characters -- word-level .split() on such text "
+                      "produces a single 'word' per utterance, so any single wrong character "
+                      "scores the WHOLE utterance as 100% wrong. Confirmed directly: a sentence "
+                      "differing by exactly one character out of sixteen scored WER=1.0 under "
+                      "the original, word-level-only scorer. Off by default -- every existing "
+                      "European-language evaluation continues to use word-level scoring, "
+                      "completely unaffected by this flag.")
+ap.add_argument("--character_based", action="store_true",
+                 help="MUST match whatever the checkpoint being evaluated was actually trained "
+                      "with (same flag name/meaning as train_multitalker_aws.py). Set this for "
+                      "checkpoints trained from a character-based pretrained backbone (e.g. "
+                      "nvidia/stt_zh_conformer_transducer_large) -- loading such a checkpoint's "
+                      "base model via the default (BPE) path fails immediately with '`cfg` must "
+                      "have `tokenizer` config', since that config block doesn't exist for a "
+                      "character-based model at all.")
 args = ap.parse_args()
 
 
@@ -80,7 +101,13 @@ def ground_truth_text_per_speaker(json_path):
 def main():
     print("Loading model...")
     model = load_model(args.overrides, args.checkpoint, args.pretrained_model,
-                        dummy_cuts_path=args.dummy_cuts_path)
+                        dummy_cuts_path=args.dummy_cuts_path, character_based=args.character_based)
+    # MUST come from the actual loaded model's own config, not an assumed default --
+    # confirmed the hard way that hardcoding the FastConformer-shaped value (8)
+    # silently corrupts mask alignment for a plain-Conformer backbone like
+    # nvidia/stt_zh_conformer_transducer_large (real value: 4).
+    num_mel_frame_per_asr_frame = num_mel_frame_per_asr_frame_from_model(model)
+    print(f"Encoder subsampling_factor (num_mel_frame_per_asr_frame): {num_mel_frame_per_asr_frame}")
 
     pred_rttms = sorted(args.pred_dir.glob("*.rttm"))
     print(f"Found {len(pred_rttms)} predicted RTTMs to evaluate\n")
@@ -133,12 +160,15 @@ def main():
                     wav_path, sortformer_segments, target_speaker=sortformer_speaker,
                     use_purity_weighted_targets=args.use_purity_weighted_targets,
                     lambda_overlap_weight=args.lambda_overlap_weight,
+                    num_mel_frame_per_asr_frame=num_mel_frame_per_asr_frame,
                 )
             except ValueError:
                 continue
 
             hypothesis_text = transcribe_with_mask(model, wav_path, spk_target, bg_spk_target)
-            wer, n_sub, n_del, n_ins, n_ref = word_error_rate(reference_text, hypothesis_text)
+            wer, n_sub, n_del, n_ins, n_ref = word_error_rate(
+                reference_text, hypothesis_text, char_level=args.char_level_scoring
+            )
 
             total_sub += n_sub
             total_del += n_del

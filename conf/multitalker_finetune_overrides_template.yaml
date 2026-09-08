@@ -16,6 +16,17 @@
 # RAM) is dataset-independent and shared across all baselines run against this recipe.
 
 model:
+  # NeMo's own internal WER metric (drives the live, during-training val_wer logged
+  # at each validation epoch, and what trainer.test() reports) defaults to word-level
+  # scoring (whitespace .split()) unless use_cer is explicitly set true here. For CJK
+  # languages with no spaces between words/characters at all, word-level scoring
+  # treats an entire un-spaced utterance as a single "word" -- confirmed directly:
+  # ANY single wrong character then scores the WHOLE utterance as 100% wrong, not the
+  # true, much smaller character-level error. Set true for Chinese via
+  # generate_training_config.py's --use_cer flag; every existing European-language
+  # config leaves this false (correct, since those ARE properly space-delimited).
+  use_cer: __USE_CER__
+
   # --- Speaker kernel injection (SpeakerKernelMixin) ---
   # 'ff' is the only implemented kernel type in this codebase as of this repo snapshot
   # (SpeakerKernelMixin.get_spk_kernel_class raises ValueError for anything else).
@@ -32,6 +43,17 @@ model:
     use_lhotse: true
     cuts_path: ???  # set via CLI override or fill in: /path/to/train_cuts.jsonl.gz
     num_speakers: 4
+    num_mel_frame_per_asr_frame: __NUM_MEL_FRAME_PER_ASR_FRAME__  # auto-filled, default 8.
+        # MUST equal the actual pretrained backbone's real encoder subsampling_factor -- this
+        # is NOT an arbitrary tuning constant, confirmed directly from NeMo's own docstring for
+        # speaker_to_target(): "encoder subsampling_factor, 8 by default". A mismatch here means
+        # every mask is built at the wrong time resolution relative to what the encoder actually
+        # outputs frame-by-frame -- confirmed the hard way: every European-language backbone
+        # used here is FastConformer (subsampling_factor=8, matching this default), but
+        # nvidia/stt_zh_conformer_transducer_large is plain Conformer (subsampling_factor=4,
+        # confirmed directly from its own loaded config) -- silently corrupting every Chinese
+        # training run's mask supervision until this was caught. Check any new backbone's own
+        # subsampling_factor explicitly before assuming this default is correct.
     use_purity_weighted_targets: __USE_PURITY_WEIGHTED_TARGETS__  # auto-filled, default false
         # (preserves original binary spk_target/bg_spk_target behavior). When true, replaces
         # the hard {0,1} mask with a continuous STNO-derived purity weight -- see
@@ -70,6 +92,7 @@ model:
     use_lhotse: true
     cuts_path: ???  # /path/to/val_cuts.jsonl.gz
     num_speakers: 4
+    num_mel_frame_per_asr_frame: __NUM_MEL_FRAME_PER_ASR_FRAME__  # matches train_ds, auto-filled
     use_purity_weighted_targets: __USE_PURITY_WEIGHTED_TARGETS__  # matches train_ds, auto-filled
     lambda_overlap_weight: __LAMBDA_OVERLAP_WEIGHT__  # matches train_ds, auto-filled
     min_duration: 1.0
@@ -93,6 +116,7 @@ model:
     use_lhotse: true
     cuts_path: ???  # /path/to/test_cuts.jsonl.gz
     num_speakers: 4
+    num_mel_frame_per_asr_frame: __NUM_MEL_FRAME_PER_ASR_FRAME__  # matches train_ds, auto-filled
     use_purity_weighted_targets: __USE_PURITY_WEIGHTED_TARGETS__  # matches train_ds, auto-filled
     lambda_overlap_weight: __LAMBDA_OVERLAP_WEIGHT__  # matches train_ds, auto-filled
     min_duration: 1.0

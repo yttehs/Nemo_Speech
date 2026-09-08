@@ -1,3 +1,5 @@
+2.sh
+
 # log and data files
 *.model
 *.pkl

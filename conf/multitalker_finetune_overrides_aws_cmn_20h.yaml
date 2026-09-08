@@ -16,6 +16,17 @@
 # RAM) is dataset-independent and shared across all baselines run against this recipe.
 
 model:
+  # NeMo's own internal WER metric (drives the live, during-training val_wer logged
+  # at each validation epoch, and what trainer.test() reports) defaults to word-level
+  # scoring (whitespace .split()) unless use_cer is explicitly set true here. For CJK
+  # languages with no spaces between words/characters at all, word-level scoring
+  # treats an entire un-spaced utterance as a single "word" -- confirmed directly:
+  # ANY single wrong character then scores the WHOLE utterance as 100% wrong, not the
+  # true, much smaller character-level error. Set true for Chinese via
+  # generate_training_config.py's --use_cer flag; every existing European-language
+  # config leaves this false (correct, since those ARE properly space-delimited).
+  use_cer: true
+
   # --- Speaker kernel injection (SpeakerKernelMixin) ---
   # 'ff' is the only implemented kernel type in this codebase as of this repo snapshot
   # (SpeakerKernelMixin.get_spk_kernel_class raises ValueError for anything else).
@@ -32,6 +43,17 @@ model:
     use_lhotse: true
     cuts_path: ???  # set via CLI override or fill in: /path/to/train_cuts.jsonl.gz
     num_speakers: 4
+    num_mel_frame_per_asr_frame: 4  # auto-filled, default 8.
+        # MUST equal the actual pretrained backbone's real encoder subsampling_factor -- this
+        # is NOT an arbitrary tuning constant, confirmed directly from NeMo's own docstring for
+        # speaker_to_target(): "encoder subsampling_factor, 8 by default". A mismatch here means
+        # every mask is built at the wrong time resolution relative to what the encoder actually
+        # outputs frame-by-frame -- confirmed the hard way: every European-language backbone
+        # used here is FastConformer (subsampling_factor=8, matching this default), but
+        # nvidia/stt_zh_conformer_transducer_large is plain Conformer (subsampling_factor=4,
+        # confirmed directly from its own loaded config) -- silently corrupting every Chinese
+        # training run's mask supervision until this was caught. Check any new backbone's own
+        # subsampling_factor explicitly before assuming this default is correct.
     use_purity_weighted_targets: false  # auto-filled, default false
         # (preserves original binary spk_target/bg_spk_target behavior). When true, replaces
         # the hard {0,1} mask with a continuous STNO-derived purity weight -- see
@@ -44,7 +66,7 @@ model:
         # frames at full weight; closer to 1 treats overlapped frames closer to today's binary
         # full-weight behavior. Not independently tuned -- a real hyperparameter to sweep.
     min_duration: 1.0
-    max_duration: 80.0      # auto-computed: see generate_training_config.py
+    max_duration: 70.0      # auto-computed: see generate_training_config.py
     max_tps: 20.0             # relaxed from 8 (1080Ti) -- that was guarding against
                                # target-text-density OOM spikes on an 8GB card. Still worth
                                # some bound as a data-quality guard, just not as tight.
@@ -59,7 +81,7 @@ model:
                                # --batch_duration if you hit CUDA OOM -- doing so through the
                                # generator (not a manual edit) keeps max_steps/warmup_steps
                                # correctly recomputed for the new value automatically.
-    quadratic_duration: 80  # matches max_duration above, auto-computed
+    quadratic_duration: 70  # matches max_duration above, auto-computed
                                # as before, this exists specifically to de-prioritize batching very
                                # long cuts together, and needs to track whatever the real cap is
     num_workers: 2            # explicit given only 4 CPU cores total on this machine --
@@ -70,10 +92,11 @@ model:
     use_lhotse: true
     cuts_path: ???  # /path/to/val_cuts.jsonl.gz
     num_speakers: 4
+    num_mel_frame_per_asr_frame: 4  # matches train_ds, auto-filled
     use_purity_weighted_targets: false  # matches train_ds, auto-filled
     lambda_overlap_weight: 0.5  # matches train_ds, auto-filled
     min_duration: 1.0
-    max_duration: 80.0      # matches train_ds, auto-computed
+    max_duration: 70.0      # matches train_ds, auto-computed
     max_tps: 20.0
     shuffle: false
     use_bucketing: false      # no need to bucket a small, one-pass validation set
@@ -93,10 +116,11 @@ model:
     use_lhotse: true
     cuts_path: ???  # /path/to/test_cuts.jsonl.gz
     num_speakers: 4
+    num_mel_frame_per_asr_frame: 4  # matches train_ds, auto-filled
     use_purity_weighted_targets: false  # matches train_ds, auto-filled
     lambda_overlap_weight: 0.5  # matches train_ds, auto-filled
     min_duration: 1.0
-    max_duration: 80.0      # matches train_ds, auto-computed
+    max_duration: 70.0      # matches train_ds, auto-computed
     max_tps: 20.0
     shuffle: false
     use_bucketing: false
@@ -132,8 +156,8 @@ model:
     betas: [0.9, 0.98]
     sched:
       name: WarmupAnnealing
-      warmup_steps: 7408   # proportional to max_steps below, auto-computed
-      max_steps: 116683         # auto-computed from your real session count and duration
+      warmup_steps: 1271   # proportional to max_steps below, auto-computed
+      max_steps: 20026         # auto-computed from your real session count and duration
                               # distribution -- see generate_training_config.py for the exact
                               # formula. Still approximate even after computation -- Lhotse's
                               # dynamic batching means actual cuts/batch varies. Watch the real
@@ -171,7 +195,7 @@ trainer:
 
 exp_manager:
   exp_dir: ./multitalker_finetune_experiments
-  name: multitalker_cmn_aws   # each dataset/language needs its own unique name here -- exp_manager_cfg
+  name: multitalker_cmn_aws_20h   # each dataset/language needs its own unique name here -- exp_manager_cfg
                         # is read straight from this file with no CLI override, so two runs
                         # sharing a name would write into the same experiment directory and risk
                         # overwriting each other's checkpoints.

@@ -100,6 +100,23 @@ ap.add_argument("--lambda_overlap_weight", type=float, default=0.5,
                       "speaker_target = P_T + lambda*P_O, bg_target = (1-lambda)*P_O + P_N. "
                       "0.5 is an arbitrary starting point, not a tuned value -- treat as a real "
                       "hyperparameter to sweep, same as any other.")
+ap.add_argument("--use_cer", action="store_true",
+                 help="Set NeMo's own internal use_cer config flag, switching the live, "
+                      "during-training val_wer metric (and trainer.test()) from word-level to "
+                      "character-level scoring. REQUIRED for CJK languages -- confirmed directly "
+                      "that word-level scoring on unspaced text like Chinese treats an entire "
+                      "utterance as one 'word', so any single wrong character reports the WHOLE "
+                      "utterance as 100% wrong. Off by default, matching every existing "
+                      "European-language config, where word-level IS the correct metric.")
+ap.add_argument("--num_mel_frame_per_asr_frame", type=int, default=8,
+                 help="MUST equal the pretrained backbone's actual encoder subsampling_factor -- "
+                      "check via model.cfg.encoder.subsampling_factor before assuming the "
+                      "default. Default (8) is correct for every FastConformer backbone used so "
+                      "far (all European languages via Parakeet-TDT); confirmed WRONG (should be "
+                      "4) for nvidia/stt_zh_conformer_transducer_large, a plain Conformer model "
+                      "-- this single mismatch silently corrupted every Chinese training run's "
+                      "mask supervision, since the mask ends up built at half the encoder's "
+                      "real time resolution.")
 args = ap.parse_args()
 
 
@@ -107,7 +124,8 @@ def main():
     expected_placeholders = ["__MAX_DURATION_FLOAT__", "__MAX_DURATION_INT__", "__MAX_STEPS__",
                               "__WARMUP_STEPS__", "__EXP_NAME__", "__RESUME_LOG_DIR__",
                               "__BATCH_DURATION__", "__USE_PURITY_WEIGHTED_TARGETS__",
-                              "__LAMBDA_OVERLAP_WEIGHT__"]
+                              "__LAMBDA_OVERLAP_WEIGHT__", "__USE_CER__",
+                              "__NUM_MEL_FRAME_PER_ASR_FRAME__"]
     template_text = args.template.read_text(encoding="utf-8")
     missing_from_template = [tok for tok in expected_placeholders if tok not in template_text]
     if missing_from_template:
@@ -162,6 +180,8 @@ def main():
         .replace("__BATCH_DURATION__", f"{args.batch_duration:g}")
         .replace("__USE_PURITY_WEIGHTED_TARGETS__", "true" if args.use_purity_weighted_targets else "false")
         .replace("__LAMBDA_OVERLAP_WEIGHT__", f"{args.lambda_overlap_weight:g}")
+        .replace("__USE_CER__", "true" if args.use_cer else "false")
+        .replace("__NUM_MEL_FRAME_PER_ASR_FRAME__", str(args.num_mel_frame_per_asr_frame))
     )
 
     remaining = [tok for tok in expected_placeholders if tok in filled]

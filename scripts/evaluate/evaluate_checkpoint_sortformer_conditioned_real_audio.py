@@ -26,10 +26,11 @@ import librosa
 import soundfile as sf
 
 from scripts.data_prep.multispeaker_inference import (
-    ENCODER_FRAME_SECONDS,
     arrival_order,
     build_mask_for_speaker,
+    encoder_frame_seconds,
     load_model,
+    num_mel_frame_per_asr_frame_from_model,
     parse_rttm,
     transcribe_with_mask,
 )
@@ -48,6 +49,14 @@ ap.add_argument("--output_json", default=None,
                  help="Where to write the per-segment transcript JSON (speaker + start/end + text, "
                       "one entry per RTTM segment), consumable by diarization_review.html. "
                       "Defaults to <wav_path stem>_transcript.json next to --wav_path.")
+ap.add_argument("--character_based", action="store_true",
+                 help="MUST match whatever the checkpoint being evaluated was actually trained "
+                      "with (same flag name/meaning as train_multitalker_aws.py). Set this for "
+                      "checkpoints trained from a character-based pretrained backbone (e.g. "
+                      "nvidia/stt_zh_conformer_transducer_large) -- loading such a checkpoint's "
+                      "base model via the default (BPE) path fails immediately with '`cfg` must "
+                      "have `tokenizer` config', since that config block doesn't exist for a "
+                      "character-based model at all.")
 args = ap.parse_args()
 
 
@@ -117,7 +126,14 @@ def bucket_words_into_segments(word_entries, speaker_segments):
 def main():
     print("Loading model...")
     model = load_model(args.overrides, args.checkpoint, args.pretrained_model,
-                        dummy_cuts_path=args.dummy_cuts_path)
+                        dummy_cuts_path=args.dummy_cuts_path, character_based=args.character_based)
+    # MUST come from the actual loaded model's own config, not an assumed default --
+    # confirmed the hard way that hardcoding the FastConformer-shaped value (8)
+    # silently corrupts mask alignment for a plain-Conformer backbone like
+    # nvidia/stt_zh_conformer_transducer_large (real value: 4).
+    num_mel_frame_per_asr_frame = num_mel_frame_per_asr_frame_from_model(model)
+    encoder_frame_seconds_value = encoder_frame_seconds(num_mel_frame_per_asr_frame)
+    print(f"Encoder subsampling_factor (num_mel_frame_per_asr_frame): {num_mel_frame_per_asr_frame}")
 
     wav_path = ensure_16k_mono(args.wav_path)
 
@@ -129,13 +145,17 @@ def main():
 
     for spk in speakers:
         try:
-            spk_target, bg_spk_target = build_mask_for_speaker(wav_path, segments, target_speaker=spk)
+            spk_target, bg_spk_target = build_mask_for_speaker(
+                wav_path, segments, target_speaker=spk,
+                num_mel_frame_per_asr_frame=num_mel_frame_per_asr_frame,
+            )
         except ValueError as e:
             print(f"--- {spk}: skipped ({e}) ---\n")
             continue
-        total_active_s = spk_target.sum().item() * ENCODER_FRAME_SECONDS
+        total_active_s = spk_target.sum().item() * encoder_frame_seconds_value
         text, word_entries = transcribe_with_mask(
-            model, wav_path, spk_target, bg_spk_target, return_word_timestamps=True
+            model, wav_path, spk_target, bg_spk_target, return_word_timestamps=True,
+            encoder_frame_seconds_value=encoder_frame_seconds_value,
         )
         print(f"--- {spk} (~{total_active_s:.1f}s active) ---")
         print(f"{text}\n")

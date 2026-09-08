@@ -26,16 +26,38 @@ from omegaconf import OmegaConf, open_dict
 
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import speaker_to_target
 from nemo.collections.asr.models.rnnt_bpe_models import EncDecRNNTBPEModel
-from nemo.collections.asr.models.multitalker_asr_models import EncDecMultiTalkerRNNTBPEModel
+from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
+from nemo.collections.asr.models.multitalker_asr_models import (
+    EncDecMultiTalkerRNNTBPEModel,
+    EncDecMultiTalkerRNNTModel,
+)
 
 # The RNNT decoder's own word-timestamp offsets are indices into the SAME
-# encoder-output frame sequence that speaker_to_target() builds its masks on
-# (num_sample_per_mel_frame * num_mel_frame_per_asr_frame / sampling_rate =
-# 160 * 8 / 16000 = 0.08s -- the "80ms/frame" convention already used
-# elsewhere in this codebase, e.g. the ~active-seconds estimate in the Tier 2/3
-# scripts). Centralized here so both the mask math and the timestamp math stay
-# using one shared constant instead of two independently-hardcoded literals.
-ENCODER_FRAME_SECONDS = 0.08
+# encoder-output frame sequence that speaker_to_target() builds its masks on.
+# encoder_frame_seconds() computes this from the ACTUAL backbone's own subsampling
+# factor -- NOT a fixed constant. Confirmed the hard way: hardcoding this at 0.08s
+# (160 * 8 / 16000, correct for every FastConformer backbone used so far, e.g.
+# Parakeet-TDT for the European languages) silently corrupted mask construction for
+# nvidia/stt_zh_conformer_transducer_large, a plain Conformer model whose real
+# subsampling_factor is 4, not 8 -- meaning encoder_frame_seconds should be 0.04s for
+# that backbone, exactly half of what was hardcoded. Always derive this from the
+# actual loaded model's own config; never assume the FastConformer-shaped default.
+def encoder_frame_seconds(num_mel_frame_per_asr_frame, num_sample_per_mel_frame=160, sampling_rate=16000):
+    return num_sample_per_mel_frame * num_mel_frame_per_asr_frame / sampling_rate
+
+
+def num_mel_frame_per_asr_frame_from_model(model):
+    """Reads the actual encoder subsampling_factor straight from a loaded model's own
+    config -- the authoritative source, rather than assuming any fixed default."""
+    factor = model.cfg.encoder.get("subsampling_factor", None)
+    if factor is None:
+        raise ValueError(
+            "Could not find encoder.subsampling_factor in this model's config -- check "
+            "model.cfg.encoder directly, since this value is REQUIRED to correctly build "
+            "speaker-activity masks (it determines the actual time resolution of the "
+            "encoder's own output frames, which the masks must align to)."
+        )
+    return factor
 
 
 def parse_rttm(path):
@@ -60,9 +82,16 @@ def arrival_order(segments):
 
 
 def load_model(overrides_path, checkpoint_path, pretrained_model="nvidia/parakeet-tdt-0.6b-v3",
-                dummy_cuts_path=None):
+                dummy_cuts_path=None, character_based=False):
     """Rebuilds the trained architecture and loads a specific checkpoint's weights.
     Same construction sequence as evaluate_checkpoint.py.
+
+    character_based: MUST match whatever the checkpoint was actually trained with
+    (same flag name/meaning as train_multitalker_aws.py --character_based). A
+    character-based pretrained model (e.g. nvidia/stt_zh_conformer_transducer_large,
+    used for Mandarin) has no tokenizer config at all -- loading it via
+    EncDecRNNTBPEModel fails immediately with "`cfg` must have `tokenizer` config",
+    since that config block simply doesn't exist for a character-based checkpoint.
 
     dummy_cuts_path: a real, valid *_cuts.jsonl.gz file (e.g. your test_cuts.jsonl.gz
     from training). NeMo's ModelPT.__init__ eagerly calls setup_training_data() the
@@ -72,7 +101,10 @@ def load_model(overrides_path, checkpoint_path, pretrained_model="nvidia/parakee
     an arbitrary placeholder string (e.g. the checkpoint path itself) does not, since
     NeMo will try to parse whatever's there as an actual Lhotse manifest.
     """
-    base_model = EncDecRNNTBPEModel.from_pretrained(pretrained_model, map_location="cpu")
+    if character_based:
+        base_model = EncDecRNNTModel.from_pretrained(pretrained_model, map_location="cpu")
+    else:
+        base_model = EncDecRNNTBPEModel.from_pretrained(pretrained_model, map_location="cpu")
     base_cfg = base_model.cfg
     del base_model
 
@@ -111,7 +143,10 @@ def load_model(overrides_path, checkpoint_path, pretrained_model="nvidia/parakee
         _resolve(merged_cfg, extract_dir)
 
     trainer = pl.Trainer(devices=1, accelerator="gpu", logger=False, enable_checkpointing=False)
-    model = EncDecMultiTalkerRNNTBPEModel(cfg=merged_cfg, trainer=trainer)
+    if character_based:
+        model = EncDecMultiTalkerRNNTModel(cfg=merged_cfg, trainer=trainer)
+    else:
+        model = EncDecMultiTalkerRNNTBPEModel(cfg=merged_cfg, trainer=trainer)
 
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=True)
@@ -157,7 +192,8 @@ def enable_word_timestamps(model):
 
 
 def build_mask_for_speaker(wav_path, segments, target_speaker, num_speakers=4,
-                            use_purity_weighted_targets=False, lambda_overlap_weight=0.5):
+                            use_purity_weighted_targets=False, lambda_overlap_weight=0.5,
+                            num_mel_frame_per_asr_frame=8):
     """
     Builds (spk_target, bg_spk_target) 1D tensors for ONE target speaker, using
     speaker_to_target() itself so mask construction exactly matches training.
@@ -174,6 +210,13 @@ def build_mask_for_speaker(wav_path, segments, target_speaker, num_speakers=4,
     continuous values here reflect boundary-alignment softening only (a segment edge
     landing mid-ASR-frame), the same mechanism as training, just without genuine
     diarization-confidence gradation since RTTM itself doesn't carry that.
+
+    num_mel_frame_per_asr_frame: MUST equal the actual model's own encoder
+    subsampling_factor -- get it via num_mel_frame_per_asr_frame_from_model(model)
+    rather than assuming the default. See that function and encoder_frame_seconds()
+    above for why this matters -- confirmed to silently corrupt mask alignment when
+    wrong, exactly the way it did for every Chinese checkpoint trained before this
+    was caught.
     """
     recording = Recording.from_file(wav_path, recording_id="eval")
     supervisions = [
@@ -185,7 +228,8 @@ def build_mask_for_speaker(wav_path, segments, target_speaker, num_speakers=4,
                   recording=recording, supervisions=supervisions, custom={})
 
     mask, texts = speaker_to_target(cut, num_speakers=num_speakers, return_text=True,
-                                     soft_label=use_purity_weighted_targets)
+                                     soft_label=use_purity_weighted_targets,
+                                     num_mel_frame_per_asr_frame=num_mel_frame_per_asr_frame)
     mask = mask.transpose(0, 1)[: len(texts)]  # [num_real_speakers, num_frames], arrival order
 
     order = arrival_order(segments)
@@ -230,7 +274,8 @@ def build_mask_for_speaker(wav_path, segments, target_speaker, num_speakers=4,
     return spk_target, bg_spk_target
 
 
-def transcribe_with_mask(model, wav_path, spk_target, bg_spk_target, return_word_timestamps=False):
+def transcribe_with_mask(model, wav_path, spk_target, bg_spk_target, return_word_timestamps=False,
+                          encoder_frame_seconds_value=None):
     """Runs the model conditioned on a manually-built speaker-activity mask,
     bypassing the training dataloader entirely.
 
@@ -240,9 +285,20 @@ def transcribe_with_mask(model, wav_path, spk_target, bg_spk_target, return_word
     returns (text, word_entries), where each entry is
     {"word": str, "start": float seconds, "end": float seconds}, session-relative
     (same time axis as the RTTM segments passed into build_mask_for_speaker).
+
+    encoder_frame_seconds_value: REQUIRED when return_word_timestamps=True -- get it
+    via encoder_frame_seconds(num_mel_frame_per_asr_frame_from_model(model)). MUST
+    match the actual model's own encoder subsampling_factor, or word timestamps come
+    out silently scaled wrong (e.g. off by 2x for a Conformer backbone if the
+    FastConformer-shaped default were assumed instead).
     """
     if return_word_timestamps:
         enable_word_timestamps(model)
+        if encoder_frame_seconds_value is None:
+            raise ValueError(
+                "encoder_frame_seconds_value is required when return_word_timestamps=True -- "
+                "get it via encoder_frame_seconds(num_mel_frame_per_asr_frame_from_model(model))."
+            )
 
     audio, sr = sf.read(wav_path)
     if audio.ndim > 1:
@@ -273,7 +329,7 @@ def transcribe_with_mask(model, wav_path, spk_target, bg_spk_target, return_word
     for w in timestamp.get("word", []):
         word_entries.append({
             "word": w["word"],
-            "start": w["start_offset"] * ENCODER_FRAME_SECONDS,
-            "end": w["end_offset"] * ENCODER_FRAME_SECONDS,
+            "start": w["start_offset"] * encoder_frame_seconds_value,
+            "end": w["end_offset"] * encoder_frame_seconds_value,
         })
     return text, word_entries
