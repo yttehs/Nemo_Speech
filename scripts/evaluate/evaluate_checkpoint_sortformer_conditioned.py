@@ -195,6 +195,35 @@ def main():
     print(f"Overall Tier 2 WER: {overall_wer:.4f}  "
           f"(sub={total_sub}, del={total_del}, ins={total_ins}, ref_words={total_ref_words})")
 
+    # --- Per-video WER, not just per-chunk ---
+    # per_session_wer_stats is keyed by chunk (e.g. "Brazil_portuguese_01-chunk0007"), one
+    # entry per chunk file -- a single video produces 15-20+ of these, so the per-chunk
+    # breakdown alone doesn't directly answer "which video is bad" without manually summing
+    # in your head. Groups chunks back to their parent video by stripping the "-chunkNNNN"
+    # suffix (the exact naming convention build_pt_test_pooled.py, and every other chunk
+    # builder in this project, uses), then pools sub/del/ins/ref_words within each video --
+    # the same pooled-rate approach already used for the overall WER above, not a naive
+    # average of per-chunk WER values (which would let short chunks skew the result as much
+    # as long ones).
+    per_video_stats = {}
+    for session_name, (sub, delc, ins, ref_words) in per_session_wer_stats.items():
+        video_name = session_name.rsplit("-chunk", 1)[0] if "-chunk" in session_name else session_name
+        v = per_video_stats.setdefault(video_name, [0, 0, 0, 0])
+        v[0] += sub
+        v[1] += delc
+        v[2] += ins
+        v[3] += ref_words
+
+    print(f"\n--- Per-video WER ({len(per_video_stats)} video(s)), worst to best ---")
+    per_video_wer = []
+    for video_name, (sub, delc, ins, ref_words) in per_video_stats.items():
+        if ref_words == 0:
+            continue
+        wer = (sub + delc + ins) / ref_words
+        per_video_wer.append((video_name, wer, ref_words))
+    for video_name, wer, ref_words in sorted(per_video_wer, key=lambda x: -x[1]):
+        print(f"  WER={wer:.4f}  {video_name}  (ref_words={ref_words})")
+
     print(f"\n--- Diarization Error Rate (Sortformer vs. MFA ground truth, collar={args.collar}s) ---")
     if total_ref_time_der > 0:
         overall_der = (total_missed + total_false_alarm + total_confusion) / total_ref_time_der

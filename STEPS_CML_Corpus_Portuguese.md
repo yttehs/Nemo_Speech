@@ -10,9 +10,11 @@ cp -r /data/home/vishwas/Workspace/FastMSS/Data/multitalker_train_data Data/CML_
 cp -r /data/home/vishwas/Workspace/FastMSS/Data/fastmss_final Data/.
 ```
 
+
 ## Generate the configuration yaml file
 ```bash
 Note: We will have to generate the yaml file based on the data being used. Few hyperparamters need to be set after checking the data sample duration.
+Note: The folder for Portuguese data has to be "Data". For now it is hardcoded based on how the folder was named in the FastMSS step. As an easy fix, I have created the soft link - Data_Portuguese -> Data  
 
 python scripts/conf/generate_training_config.py \
     --template conf/multitalker_finetune_overrides_template.yaml \
@@ -86,5 +88,46 @@ PYTHONPATH=. LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" p
 ```bash
 
 ```
+
+
+### Evaluation of the Gold-Standard labels - Youtube videos downloaded and processed based on captions
+
+```bash
+# 1. Generate the "test_pooled" folder; Run this step on all the video files you have. 
+python scripts/data_prep/build_pt_test_pooled.py \
+    --video Data_Portuguese/video/Brazil/Brazil_portuguese_01.mp4 \
+    --attribution Data_Portuguese/transcript/Brazil/Brazil_portuguese_01_speaker_attribution_final.json \
+    --output_dir Data_Portuguese/test_pooled
+
+#2. Evaluate with the ground truth speaker turn labels as ground truth
+a) Copy the groundtruth rttm file
+mkdir Data_Portuguese/test_pooled_oracle_preds
+cp Data_Portuguese/test_pooled/*.rttm Data_Portuguese/test_pooled_oracle_preds/
+
+b) Evaluate
+PYTHONPATH=. LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python scripts/evaluate/evaluate_checkpoint_sortformer_conditioned.py \
+    --overrides conf/multitalker_finetune_overrides_aws_cmltts_pt.yaml \
+    --checkpoint multitalker_finetune_experiments/multitalker_pt_cmltts_aws/checkpoints/multitalker_pt_cmltts_aws--val_wer=0.4855-epoch=42.ckpt \
+    --ref_dir Data_Portuguese/test_pooled \
+    --pred_dir Data_Portuguese/test_pooled_oracle_preds \
+    --dummy_cuts_path Data_Portuguese/multitalker_train_data_small/test_cuts.jsonl.gz \
+    --pretrained_model nvidia/parakeet-tdt-0.6b-v3
+
+#3. Evaluate with Sortformer diarization labels
+a) Generate Sortformer labels
+PYTHONPATH=. LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python scripts/data_prep/run_sortformer_batch.py \
+    --wav_dir Data_Portuguese/test_pooled \
+    --output_dir Data_Portuguese/test_pooled_sortformer_preds
+
+PYTHONPATH=. LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib" python scripts/evaluate/evaluate_checkpoint_sortformer_conditioned.py \
+    --overrides conf/multitalker_finetune_overrides_aws_cmltts_pt.yaml \
+    --checkpoint multitalker_finetune_experiments/multitalker_pt_cmltts_aws/checkpoints/multitalker_pt_cmltts_aws--val_wer=0.4855-epoch=42.ckpt \
+    --ref_dir Data_Portuguese/test_pooled \
+    --pred_dir Data_Portuguese/test_pooled_sortformer_preds \
+    --dummy_cuts_path Data_Portuguese/multitalker_train_data_small/test_cuts.jsonl.gz \
+    --pretrained_model nvidia/parakeet-tdt-0.6b-v3
+```
+
+
 
 Note: The imports - PYTHONPATH=. and LD_LIBRARY_PATH="/opt/amazon/openmpi/lib:/usr/local/lib:/usr/lib", were quick fixes to work on my system. You may not need them. There would be a better and neater way to deal with this. Feel free to update accordingly.
